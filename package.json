@@ -1,0 +1,25 @@
+{
+  "name": "YDAgent",
+  "appid": "8000000000009871",
+  "version": "1.0.0",
+  "description": "Let your Youdao Dictionary Pen use AI！",
+  "quickjs": { "version": "20200705", "bigNum": false },
+  "simulator": { "path": "../haas_sim", "page": "" },
+  "single-js-bundle": false,
+  "scripts": {
+    "start": "aiot-cli preview",
+    "build": "aiot-cli -p",
+    "build:dev": "aiot-cli",
+    "build:bin": "aiot-cli -q -p",
+    "build:prod": "aiot-cli -c -q -p",
+    "build:simulator": "aiot-cli simulator ./",
+    "check": "aiot-cli check"
+  },
+  "keywords": ["youdao", "dictionary-pen", "falcon", "miniapp", "deepseek"],
+  "dependencies": {
+    "falcon-ui": "^1.0.3"
+  },
+  "devDependencies": {
+    "aiot-vue-cli": "1.0.32"
+  }
+}

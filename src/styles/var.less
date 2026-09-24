@@ -1,0 +1,56 @@
+// 全局 less 变量。
+//
+// 色值/字号取自**有道词典笔官方设计系统**（提取自设备内置 app 的字节码字符串池，
+// 详见 docs/official-design-tokens.md）：
+//   设计系统名 yd-dictpen-haasui，字体 OPPOSans，基准画布 600×960
+//   主强调色 #f9532f（官方橙）、深色底 #1a1b1f/#151626、正文纯白
+//
+// 注意：less 变量不参与属性继承，仅在对应 class 引用时生效。
+
+// ---------- 文本 ----------
+@text-primary: #ffffff;
+@text-secondary: #a8aab2;
+@text-muted: #909199;
+@text-faint: #515259;
+
+// ---------- 背景（官方深色阶）----------
+// 纯黑底是官方 app 的基调：实机截取应用商店界面，背景 #000000 占全局 68%，
+// 卡片 #1a1b1f，次要文字 #909199（与字节码提取的灰阶一致）。
+@background-page: #000000;
+@background-card: #1a1b1f;
+@background-elevated: #2d2e33;
+@background-input: #1a1b1f;
+@background-sunken: #101010;
+
+// ---------- 主色（官方橙）----------
+@primary: #f9532f;
+@primary-light: #ff7e08;
+@primary-deep: #e9900c;
+@primary-soft: rgba(249, 83, 47, 0.16);
+
+// ---------- 功能色 ----------
+@accent-blue: #5687ff;
+@danger: #ff3333;
+@danger-soft: rgba(255, 51, 51, 0.16);
+@success: #13b876;
+@warning-bg: rgba(241, 152, 36, 0.16);
+@warning-text: #f19824;
+
+// ---------- 线条 ----------
+@border-color: rgba(255, 255, 255, 0.08);
+@border-strong: rgba(255, 255, 255, 0.16);
+
+// ---------- 圆角 ----------
+@radius-small: 8rpx;
+@radius-medium: 18rpx;
+@radius-large: 28rpx;
+@radius-pill: 999rpx;
+
+// ---------- 间距 ----------
+@gap-tiny: 8rpx;
+@gap-small: 16rpx;
+@gap-normal: 24rpx;
+@gap-large: 40rpx;
+
+// ---------- 字体（设备内置）----------
+@font-family: OPPOSans, Noto Sans, sans-serif;

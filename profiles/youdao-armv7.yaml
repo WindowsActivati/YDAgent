@@ -1,0 +1,39 @@
+# 有道词典笔 DeepSeek 应用设备画像
+# 来源：用户提供（未做真机探测，属待验证线索）；本项目开发时以本文件为构建输入。
+
+profile_id: youdao-armv7-deepseek
+model: ""                    # 待真机确认（词典笔型号）
+firmware: ""                 # 待真机确认
+runtime:
+  falcon: ""                 # 待真机确认
+  vue: "2"                   # aiot-vue-cli Vue 2 SFC
+  quickjs: "20200705"
+abi:
+  machine: arm               # 芯片支持 ARMv8/ARMv7，系统编译为 32 位 → 按 ARMv7 构建
+  bits: 32
+  endian: little
+  libc: glibc                # arm-linux-gnueabihf，待真机 ldd 确认
+  toolchain: arm-linux-gnueabihf
+screen:
+  source: /etc/miniapp/resources/cfg.json   # 设备上读取宽高（运行时探测）
+  design_width: 0            # App.onLaunch 用 cfg.json 的值 setViewPort；兜底见 src/services/device-config.js
+input_method:
+  version: ""                # 有道输入法
+  global_text_edit: untested # 代码按 global.startTextEdit 路径实现，待真机验证
+  textarea_soft_input: untested
+media:
+  gstreamer: ""
+  decoder: ""
+  kms_driver: ""
+  connector: ""
+  plane: null
+package:
+  appid: "8000000000000001"
+  version: "1.0.0"
+  start_page: chat
+backend:
+  deepseek_base_url: https://api.deepseek.com/v1
+  default_model: deepseek-chat
+validation:
+  tested_at: ""              # 待真机
+  evidence: []

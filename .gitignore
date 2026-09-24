@@ -1,0 +1,49 @@
+# ============================================================================
+#  YDAgent — Git 排除规则
+# ============================================================================
+
+# ---------- 构建产物（不进仓库）----------
+# AMR 安装包：每次打包都重新生成，且体积大
+*.amr
+
+# aiot-vue-cli 的构建中间目录
+.falcon_/
+.falcon_tmp/
+
+# native 编译产物
+native/build/
+libs/
+*.so
+*.o
+*.a
+
+# build.sh 生成的嵌入式 CA 证书头（约 1.1MB，由 cacert.pem 生成）
+native/src/DeepSeekModule/cacert.h
+
+# 构建日志
+native/build.log
+*.log
+
+# ---------- 依赖 ----------
+node_modules/
+
+# ---------- 本地工具链与工作目录 ----------
+# .tools/ 放的是本地下载的 node 运行时、设备诊断程序、逆向分析用的 app 副本等
+# （160MB+，且与具体机器相关，不进仓库）
+.tools/
+
+# ---------- 第三方源码（从 tar.gz 解压，见 native/build.sh 自动解压）----------
+native/third_party/mbedtls/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 本地临时文件 ----------
+*.tmp
+*.bak
+*~
