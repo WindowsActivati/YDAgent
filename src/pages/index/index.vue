@@ -1,7 +1,7 @@
 <template>
   <view class="root">
     <!-- ===================== 聊天页 ===================== -->
-    <view class="chat-page" v-if="!settingsOpen">
+    <view class="chat-page" v-if="!settingsOpen && !confirmCmd">
     <!-- 顶部栏 -->
     <view class="header">
       <!-- 菜单键：打开会话列表 / 新建对话 -->
@@ -39,6 +39,10 @@
         <!-- 用户：右对齐橙色气泡 -->
         <view class="bubble-user" v-if="m.role === 'user'">
           <text class="bubble-user-text">{{ m.content }}</text>
+        </view>
+        <!-- 命令执行记录：等宽深色块，与普通回答区分开 -->
+        <view class="bubble-ai-command" v-else-if="m.isCommand">
+          <text class="bubble-ai-command-text">{{ m.content }}</text>
         </view>
         <!-- AI：左对齐卡片气泡 -->
         <view class="bubble-ai" v-else>
@@ -112,10 +116,54 @@
       </scroller>
     </view>
 
+    <!-- ===================== 命令授权页 =====================
+         AI 提议执行 shell 命令时必须经用户逐条确认。这是唯一的执行闸门，
+         不能被绕过——任何"自动放行"改动都等于把 root 权限交给模型。 -->
+    <view class="settings-page" v-if="confirmCmd">
+      <view class="settings-header">
+        <text class="settings-title">执行命令？</text>
+        <view class="danger-badge" v-if="confirmDangers.length">
+          <text class="danger-badge-text">危险</text>
+        </view>
+      </view>
+
+      <scroller class="settings-body">
+        <text class="field-label" v-if="confirmReason">AI 的理由</text>
+        <text class="confirm-reason" v-if="confirmReason">{{ confirmReason }}</text>
+
+        <text class="field-label field-label-gap">将要执行</text>
+        <view class="cmd-box">
+          <text class="cmd-text">{{ confirmCmd }}</text>
+        </view>
+
+        <!-- 危险命令：红字警告，但仍允许执行（用户可保留高级操作自由） -->
+        <view class="danger-note" v-if="confirmDangers.length">
+          <text class="danger-note-title">⚠ 这条命令有风险</text>
+          <text class="danger-note-item" v-for="(d, i) in confirmDangers" :key="i">· {{ d }}</text>
+        </view>
+      </scroller>
+
+      <view class="confirm-actions">
+        <view class="deny-btn" activeClass="deny-btn-active" @click="onDenyCommand">
+          <text class="deny-btn-text">拒绝</text>
+        </view>
+        <view
+          class="allow-btn"
+          :activeClass="'allow-btn-active'"
+          :class="{ 'allow-btn-danger': confirmDangers.length > 0 }"
+          @click="onAllowCommand"
+        >
+          <text class="allow-btn-text">允许执行</text>
+        </view>
+      </view>
+    </view>
+
     <!-- ===================== 设置页 =====================
          整页替换而非覆盖层：nvue 的 position:fixed + z-index 在这台设备上
-         渲染错乱（与聊天页重叠、退不出去）。改为同时只渲染一个页面。 -->
-    <view class="settings-page" v-else>
+         渲染错乱（与聊天页重叠、退不出去）。改为同时只渲染一个页面。
+         注意：这里用显式 v-if 而不是 v-else——上面插入了命令授权页，
+         v-else 会错误地绑定到它的条件上。 -->
+    <view class="settings-page" v-if="settingsOpen">
       <view class="settings-header">
         <text class="settings-title">设置</text>
         <view class="settings-done" activeClass="settings-done-active" @click="onCloseSettings">
@@ -159,6 +207,7 @@ import api from '../../services/deepseek-api.js';
 import { openTextEditor, closeTextEditSession, releaseInput, defaultTextEditConfig } from '../../services/input.js';
 import { selfTest, logDiag } from '../../services/storage.js';
 import { loadSessions, saveSessions, emptySession, deriveTitle } from '../../services/sessions.js';
+import { runWithTools } from '../../services/agent.js';
 import CONFIG from '../../config.js';
 
 // 诊断输出（app 内 console 不进设备日志，统一走 native 落盘到 /tmp/deepseek_diag.log）
@@ -195,6 +244,11 @@ export default {
       menuOpen: false,
       sessions: [],
       activeId: '',
+      // 命令授权（AI 每次要执行命令都会填这里并弹出确认页）
+      confirmCmd: '',
+      confirmReason: '',
+      confirmDangers: [],
+      _confirmResolve: null,
     };
   },
 
@@ -345,13 +399,52 @@ export default {
       };
 
       try {
-        const reply = await api.chatStream(
-          this.messages.filter((m) => m !== bubble), // 不含空气泡（避免空 assistant 入上下文）
-          { signal: { aborted: this.destroyed || gen !== this.generation } },
-          onDelta
+        // 走 agent 循环：模型可以请求执行命令，每条都要用户确认。
+        // 模型调用工具时输出的说明文字作为独立气泡展示，最终回答写进 bubble。
+        const reply = await runWithTools(
+          this.messages.filter((m) => m !== bubble), // 不含空气泡
+          {
+            signal: { aborted: this.destroyed || gen !== this.generation },
+            onAssistantText: (text) => {
+              if (this.destroyed || gen !== this.generation) return;
+              if (text && text.trim()) {
+                // 插到当前气泡之前（保持时序：先说话，后执行命令）
+                const at = this.messages.indexOf(bubble);
+                this.messages.splice(at < 0 ? this.messages.length : at, 0, {
+                  role: 'assistant',
+                  content: text,
+                });
+                this.scrollToBottom();
+              }
+            },
+            onConfirm: (info) => this.askCommandPermission(info),
+            onCommandStart: (info) => {
+              if (this.destroyed || gen !== this.generation) return;
+              const at = this.messages.indexOf(bubble);
+              this.messages.splice(at < 0 ? this.messages.length : at, 0, {
+                role: 'assistant',
+                content: '执行命令：' + info.command,
+                isCommand: true,
+              });
+              this.scrollToBottom();
+            },
+            onCommandEnd: (info) => {
+              if (this.destroyed || gen !== this.generation) return;
+              const r = info.result || {};
+              const head = '输出' + (r.code === 0 ? '' : '（退出码 ' + r.code + '）') + '：';
+              const body = (r.output || '(无输出)').slice(0, 1200);
+              const at = this.messages.indexOf(bubble);
+              this.messages.splice(at < 0 ? this.messages.length : at, 0, {
+                role: 'assistant',
+                content: head + '\n' + body,
+                isCommand: true,
+              });
+              this.scrollToBottom();
+            },
+          }
         );
         if (this.destroyed || gen !== this.generation) return;
-        bubble.content = reply; // 以完整正文为准（增量可能丢过一段）
+        bubble.content = reply;
       } catch (e) {
         if (this.destroyed || gen !== this.generation) return;
         const msg = e && e.message ? e.message : '请求失败，请稍后重试';
@@ -378,6 +471,39 @@ export default {
           this.persistHistory();
         }
       }
+    },
+
+    // ---------- 命令授权 ----------
+    // 显示确认页并等待用户决定。返回 Promise<boolean>。
+    // ⚠ 这是命令执行的唯一闸门：runWithTools 里的任何命令都会经过这里。
+    askCommandPermission(info) {
+      return new Promise((resolve) => {
+        this.confirmCmd = info.command;
+        this.confirmReason = info.reason || '';
+        this.confirmDangers = info.dangers || [];
+        this._confirmResolve = resolve;
+        diag('待授权命令: ' + info.command + (this.confirmDangers.length ? '（危险）' : ''));
+      });
+    },
+
+    onAllowCommand() {
+      const r = this._confirmResolve;
+      this._confirmResolve = null;
+      this.confirmCmd = '';
+      this.confirmReason = '';
+      this.confirmDangers = [];
+      diag('用户允许执行');
+      if (r) r(true);
+    },
+
+    onDenyCommand() {
+      const r = this._confirmResolve;
+      this._confirmResolve = null;
+      this.confirmCmd = '';
+      this.confirmReason = '';
+      this.confirmDangers = [];
+      diag('用户拒绝执行');
+      if (r) r(false);
     },
 
     // 把当前消息写回活动会话，并按时间倒序落盘（空会话不落盘）
@@ -1282,6 +1408,169 @@ export default {
   flex-direction: column;
   padding-left: 24rpx;
   padding-right: 24rpx;
+}
+
+// ---------- 命令授权页 ----------
+.danger-badge {
+  height: 36rpx;
+  padding-left: 16rpx;
+  padding-right: 16rpx;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  border-radius: @radius-pill;
+  background-color: @danger;
+}
+
+.danger-badge-text {
+  font-size: 18rpx;
+  font-weight: bold;
+  color: #ffffff;
+  line-height: 24rpx;
+}
+
+.confirm-reason {
+  font-size: 24rpx;
+  color: @text-secondary;
+  line-height: 34rpx;
+}
+
+// 命令本体：等宽感 + 深色底，便于核对
+.cmd-box {
+  width: 100%;
+  padding-top: 18rpx;
+  padding-bottom: 18rpx;
+  padding-left: 20rpx;
+  padding-right: 20rpx;
+  border-radius: @radius-medium;
+  background-color: @background-sunken;
+  border-width: 1rpx;
+  border-style: solid;
+  border-color: @border-strong;
+}
+
+.cmd-text {
+  font-size: 24rpx;
+  color: @primary;
+  line-height: 34rpx;
+  overflow-wrap: break-word;
+}
+
+.danger-note {
+  width: 100%;
+  margin-top: 16rpx;
+  padding-top: 14rpx;
+  padding-bottom: 14rpx;
+  padding-left: 18rpx;
+  padding-right: 18rpx;
+  border-radius: @radius-medium;
+  background-color: @danger-soft;
+  border-width: 1rpx;
+  border-style: solid;
+  border-color: @danger;
+  display: flex;
+  flex-direction: column;
+}
+
+.danger-note-title {
+  font-size: 22rpx;
+  font-weight: bold;
+  color: @danger;
+  line-height: 30rpx;
+}
+
+.danger-note-item {
+  margin-top: 6rpx;
+  font-size: 20rpx;
+  color: @text-secondary;
+  line-height: 28rpx;
+}
+
+.confirm-actions {
+  width: 100%;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding-left: 24rpx;
+  padding-right: 24rpx;
+  padding-top: 12rpx;
+  flex-shrink: 0;
+}
+
+.deny-btn {
+  flex: 1;
+  height: 76rpx;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  border-radius: @radius-pill;
+  background-color: @background-elevated;
+}
+
+.deny-btn-active {
+  background-color: @border-strong;
+}
+
+.deny-btn-text {
+  font-size: 26rpx;
+  color: @text-secondary;
+  line-height: 34rpx;
+}
+
+.allow-btn {
+  flex: 1;
+  height: 76rpx;
+  margin-left: 16rpx;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  border-radius: @radius-pill;
+  background-color: @primary;
+}
+
+.allow-btn-active {
+  background-color: @primary-deep;
+}
+
+// 危险命令的允许按钮用红色，强化"这是有风险的操作"
+.allow-btn-danger {
+  background-color: @danger;
+}
+
+.allow-btn-text {
+  font-size: 26rpx;
+  font-weight: bold;
+  color: #ffffff;
+  line-height: 34rpx;
+}
+
+// ---------- 命令类气泡（执行记录）----------
+.bubble-ai-command {
+  max-width: 590rpx;
+  margin-right: auto;
+  padding-top: 14rpx;
+  padding-bottom: 14rpx;
+  padding-left: 20rpx;
+  padding-right: 20rpx;
+  border-top-left-radius: 8rpx;
+  border-top-right-radius: 20rpx;
+  border-bottom-left-radius: 20rpx;
+  border-bottom-right-radius: 20rpx;
+  background-color: @background-sunken;
+  border-width: 1rpx;
+  border-style: solid;
+  border-color: @border-strong;
+}
+
+.bubble-ai-command-text {
+  font-size: 22rpx;
+  color: @text-secondary;
+  line-height: 32rpx;
+  overflow-wrap: break-word;
+  font-family: monospace;
 }
 
 // 未配置时的引导说明

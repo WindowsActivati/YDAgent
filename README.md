@@ -11,6 +11,8 @@
 - **多会话**：左侧抽屉管理多个独立对话，自动命名、可切换/删除
 - **多轮上下文**：每个会话独立保存，按 token 预算自动裁剪
 - **本地持久化**：对话与配置落盘到 app 私有目录（native 文件 IO）
+- **AI 可操作设备**：模型能提议执行 shell 命令排查/操作词典笔，
+  **每条命令都必须经用户确认**（见下方「命令执行与安全」）
 - 自动适配屏幕尺寸（真机从 `/etc/miniapp/resources/cfg.json` 读取）
 - 双通道网络：优先走 native HTTPS 插件（自包含 mbedtls），失败时回退 `$falcon.jsapi.net.request`
 
@@ -46,6 +48,8 @@ YDAgent/
 │   ├── pages/index/           # 主页面：聊天 + 会话抽屉 + 设置页
 │   ├── services/
 │   │   ├── deepseek-api.js    # API 服务（native → net.request 双通道 + 上下文裁剪）
+│   │   ├── agent.js           # 工具调用循环（授权 → 执行 → 结果回填）
+│   │   ├── tools.js           # 工具定义 + 危险命令识别 + 命令执行封装
 │   │   ├── sessions.js        # 多会话管理（存储、迁移、命名）
 │   │   ├── storage.js         # 存储兼容层（native 文件 IO → $falcon.jsapi.storage → 内存）
 │   │   ├── input.js           # 系统输入法封装
@@ -109,6 +113,29 @@ adb shell miniapp_cli start <appid> index
 两者都填写后才能开始对话。配置存入设备本地，退出重进保留；设置页可随时修改或清除。
 
 任何 **OpenAI 兼容接口**都可以用（只需填对应端点与 Key）。
+
+## 命令执行与安全
+
+模型可通过 `run_command` 工具在设备上执行 shell 命令（设备为 Buildroot Linux、
+**root 权限**，`/` 只读、`/userdata` 与 `/tmp` 可写）。
+
+**安全模型**（`src/services/tools.js` + `src/services/agent.js`）：
+
+| 机制 | 说明 |
+| --- | --- |
+| **每条命令都需用户确认** | 唯一执行闸门 `onConfirm`；代码里没有「自动放行」路径 |
+| **危险命令只警告不拦截** | 命中 15 条危险模式时确认页红字提示风险，用户仍可执行 |
+| **无交互式命令** | 子进程 stdin 重定向 `/dev/null`，避免 vim/top 之类挂住 |
+| **超时强制终止** | 设备无 `timeout` 命令，native 用 `poll + kill(进程组)` 自实现 |
+| **输出上限 256KB** | 防大输出打爆内存 |
+| **PC 模拟器不执行命令** | mock 只回显，避免在开发机上跑模型生成的命令 |
+
+危险模式覆盖：`rm -rf /`、`dd of=/dev/*`、`mkfs`、分区工具、`reboot/halt`、
+`chmod -R 777 /`、fork 炸弹、`kill -1`、内核模块、iptables、`/dev/*` 重定向等。
+
+> ⚠ 注意：由于「只警告不拦截」，若模型被聊天内容诱导（prompt injection）而用户
+> 未细看就确认，`/userdata` 下的数据可能被删除。确认页会展示命令原文与风险说明，
+> 执行前请扫一眼。
 
 ## 通信契约（native ↔ JS）
 

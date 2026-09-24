@@ -44,6 +44,7 @@ extern JSValue createDeepSeekModule(JQModuleEnv *env)
     tpl->SetProtoMethod("saveStore", &JSDeepSeek::saveStore);             // sync
     tpl->SetProtoMethodPromise("chat", &JSDeepSeek::chat);                // promise
     tpl->SetProtoMethodPromise("chatStream", &JSDeepSeek::chatStream);    // promise + publish('delta')
+    tpl->SetProtoMethodPromise("execCommand", &JSDeepSeek::execCommand);  // promise（AI 工具调用）
 
     JSDeepSeek::InitTpl(tpl);
     return tpl->CallConstructor();
@@ -207,6 +208,39 @@ void JSDeepSeek::chatStream(JQAsyncInfo &info)
 
         std::string resultJson = w->chatStream(requestJson, onDelta);
         info.post(Bson(resultJson));
+    } catch (const std::exception &e) {
+        info.postError(e.what());
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 异步：执行 shell 命令（AI 工具调用）
+//   info[0] = 命令字符串
+//   info[1] = 超时毫秒（可选，默认 15000）
+//   resolve = JSON 字符串 {"code":N,"output":"...","timedOut":bool,"truncated":bool}
+//
+// ⚠ 本层不做安全判断：危险命令识别与用户授权由 JS 侧负责（src/services/tools.js）。
+//   命令在工作线程执行，可阻塞（内部有超时兜底）。
+// ----------------------------------------------------------------------------
+void JSDeepSeek::execCommand(JQAsyncInfo &info)
+{
+    try {
+        if (info.Length() < 1 || !info[0].is_string()) {
+            info.postError("execCommand: 需要命令字符串");
+            return;
+        }
+        std::string cmd = info[0].string_value();
+        int timeoutMs = 15000;
+        if (info.Length() >= 2 && info[1].is_number()) {
+            timeoutMs = (int)info[1].number_value();
+        }
+
+        DeepSeekWorker *w = getWorker();
+        if (w == nullptr) {
+            info.postError("deepseek worker 未初始化");
+            return;
+        }
+        info.post(Bson(w->execCommand(cmd, timeoutMs)));
     } catch (const std::exception &e) {
         info.postError(e.what());
     }

@@ -164,10 +164,34 @@ export function trimContext(messages, budgetTokens) {
   return kept;
 }
 
+// 判断是否为 agent 协议消息（带 tool_calls 的 assistant / tool 结果）。
+// 这类消息有严格的结构要求，不能像普通对话那样被裁剪或改写角色。
+function isProtocolMessage(m) {
+  return !!(m && (m.role === 'tool' || (m.role === 'assistant' && Array.isArray(m.tool_calls))));
+}
+
 export function buildPayload(messages, model) {
-  const kept = trimContext(messages);
+  const src = messages || [];
+  // 普通对话部分参与上下文裁剪；协议消息（tool_calls / tool 结果）必须整段保留，
+  // 否则 API 会因为 tool 消息找不到对应的 assistant 而报错。
+  const plain = src.filter((m) => !isProtocolMessage(m));
+  const kept = trimContext(plain);
+  const keptSet = new Set(kept);
+
   const msgs = [{ role: 'system', content: SYSTEM_PROMPT }];
-  kept.forEach((m) => {
+  src.forEach((m) => {
+    if (!m || typeof m.content !== 'string') return;
+    if (isProtocolMessage(m)) {
+      if (m.role === 'tool') {
+        msgs.push({ role: 'tool', tool_call_id: m.tool_call_id, content: m.content });
+      } else {
+        const item = { role: 'assistant', content: m.content || '' };
+        if (Array.isArray(m.tool_calls) && m.tool_calls.length) item.tool_calls = m.tool_calls;
+        msgs.push(item);
+      }
+      return;
+    }
+    if (!keptSet.has(m)) return; // 被上下文裁剪掉的旧消息
     msgs.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content });
   });
   return {
@@ -280,6 +304,53 @@ function ensureDeltaSubscription() {
 }
 
 // ---------- 主入口 ----------
+
+// 底层调用：返回 { content, toolCalls }，供 agent 循环使用（需要看到 tool_calls）。
+// 普通 UI 走 chat() / chatStream()，不需要关心这一层。
+export async function chatRaw(messages, opts) {
+  const optsObj = opts || {};
+  const signal = optsObj.signal || null;
+  const apiKey = optsObj.apiKey || (await resolveApiKey());
+  const apiBaseUrl = optsObj.apiBaseUrl || (await resolveApiBaseUrl());
+  if (!apiKey || !apiBaseUrl) throw new ApiError(NOT_CONFIGURED_MSG, NOT_CONFIGURED, 0);
+
+  const payload = buildPayload(messages, optsObj.model);
+  if (Array.isArray(optsObj.tools) && optsObj.tools.length) {
+    payload.tools = optsObj.tools;
+    if (optsObj.tool_choice) payload.tool_choice = optsObj.tool_choice;
+  }
+
+  let nativeError = null;
+  if (typeof DeepSeek.chat === 'function') {
+    try {
+      const body = Object.assign({}, payload, {
+        api_base_url: apiBaseUrl,
+        api_key: apiKey,
+        timeout_ms: CONFIG.requestTimeoutMs,
+      });
+      const raw = await withTimeout(
+        Promise.resolve(DeepSeek.chat(JSON.stringify(body))),
+        CONFIG.requestTimeoutMs + 5000
+      );
+      const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (res && res.ok === true) {
+        return { content: res.content || '', toolCalls: res.tool_calls || null };
+      }
+      const err = (res && res.error) || {};
+      if (err.code !== NET_UNAVAILABLE) {
+        throw new ApiError(err.message || 'native 请求失败', err.code || 'native_error', err.status || 0);
+      }
+      nativeError = new ApiError(err.message || 'native 网络不可用', NET_UNAVAILABLE, 0);
+    } catch (e) {
+      if (e instanceof ApiError && e.code !== NET_UNAVAILABLE) throw e;
+      nativeError = e;
+    }
+  }
+
+  // 回退到系统网络桥（不支持 function calling，仅普通对话）
+  const r = await netFallbackChat(payload, apiBaseUrl, apiKey, signal, nativeError ? nativeError.message : null);
+  return { content: r.content || '', toolCalls: null };
+}
 
 // messages: [{role:'user'|'assistant', content}]
 // 返回 AI 回复文本（string）；失败抛 ApiError。
@@ -418,6 +489,7 @@ export async function chatStream(messages, opts, onDelta) {
 
 export default {
   chat,
+  chatRaw,
   chatStream,
   resolveApiKey,
   resolveApiBaseUrl,

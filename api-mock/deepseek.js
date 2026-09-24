@@ -121,6 +121,26 @@ export const DeepSeek = {
   },
 };
 
+// 命令执行 mock：PC 上**故意不执行**任何命令，只把内容打出来。
+// 理由：模拟器跑在开发机上，真执行 shell 会在你的电脑上跑 AI 生成的命令，
+// 风险与收益完全不对等。真机由 native execCommand 实现。
+DeepSeek.execCommand = function (cmd, timeoutMs) {
+  const msg = '[mock-execCommand] 模拟器不执行命令，仅回显: ' + cmd;
+  try {
+    if (typeof console !== 'undefined' && console.log) console.log(msg);
+  } catch (e) {
+    /* 忽略 */
+  }
+  return Promise.resolve(
+    JSON.stringify({
+      code: 0,
+      output: msg + '\n（真机才会实际执行）',
+      timedOut: false,
+      truncated: false,
+    })
+  );
+};
+
 // 诊断日志（真机写 /tmp/deepseek_diag.log；PC 上打到 console）
 DeepSeek.debugLog = function (text) {
   try {

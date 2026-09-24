@@ -41,6 +41,20 @@ public:
     // 请求体里 stream 由本函数强制置 true，JS 侧无需关心。
     std::string chatStream(const std::string &requestJson, const DeltaFn &onDelta) const;
 
+    // ---------------------------------------------------------------------
+    // 执行 shell 命令（AI 工具调用用）
+    //
+    // ⚠ 安全边界：本函数**不做任何安全判断**——是否危险、要不要拦截、用户是否
+    //   授权，全部由 JS 侧负责（见 src/services/tools.js）。这里只保证：
+    //     · 有超时（设备无 timeout 命令，用 poll + kill 自己实现）
+    //     · 输出有上限（防 OOM）
+    //     · 子进程一定会被回收（waitpid，无僵尸进程）
+    //
+    // 返回 JSON：{"code":N,"output":"...","timedOut":bool,"truncated":bool}
+    //   code = 子进程退出码；被信号杀死时为 128+signal
+    // 注意：本函数阻塞，必须在工作线程调用（JS 侧走 Promise 异步接口）。
+    std::string execCommand(const std::string &cmd, int timeoutMs) const;
+
     // 诊断日志：把 text 追加到 /tmp/deepseek_diag.log（失败静默）。
     // 用途：app 内 console 输出不会进设备日志（实测 console(appid) 从未出现），
     // 排查 JS 侧问题（如 storage API 探测结果）时唯一可靠的落盘通道。

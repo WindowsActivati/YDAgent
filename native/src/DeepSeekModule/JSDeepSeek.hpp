@@ -43,6 +43,12 @@ public:
     // 用途：app 内 console 输出不进设备日志，排查 JS 侧问题时靠它落盘
     void debugLog(JQUTIL_NS::JQFunctionInfo &info);
 
+    // 异步 Promise：执行 shell 命令（AI 工具调用）
+    //   info[0] = 命令；info[1] = 超时毫秒（可选）
+    //   resolve = {"code","output","timedOut","truncated"}
+    // ⚠ 安全判断（危险命令识别、用户授权）在 JS 侧，本层只保证超时与回收。
+    void execCommand(JQUTIL_NS::JQAsyncInfo &info);
+
     // 同步：本地持久化（native 直读直写 app 私有 data 目录）
     // 真机 $falcon.jsapi.storage.setStorage 的 Promise 不 resolve（实测自检日志
     // 一行不出、loadHistory 卡死），故改用 native 文件 IO，行为完全可控。

@@ -30,10 +30,12 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
 #include <string>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <vector>
@@ -620,6 +622,22 @@ bool extractContent(const JVal &body, std::string &out)
     return true;
 }
 
+// 提取 choices[0].message.tool_calls（function calling）。
+// 命中时把整段 tool_calls 序列化成 JSON 文本交给 JS 侧处理
+// （JS 负责校验、请求用户授权、再回填结果）。
+bool extractToolCalls(const JVal &body, std::string &outJson)
+{
+    if (body.type != JVal::OBJ) return false;
+    const JVal *choices = body.find("choices");
+    if (choices == nullptr || choices->type != JVal::ARR || choices->arr.empty()) return false;
+    const JVal *msg = choices->at(0)->find("message");
+    if (msg == nullptr || msg->type != JVal::OBJ) return false;
+    const JVal *tc = msg->find("tool_calls");
+    if (tc == nullptr || tc->type != JVal::ARR || tc->arr.empty()) return false;
+    outJson = tc->dump();
+    return true;
+}
+
 // 提取 error.message（存在则覆盖默认错误文案）
 void extractError(const JVal &body, std::string &out)
 {
@@ -1113,6 +1131,139 @@ std::string DeepSeekWorker::saveStore(const std::string &content) const
     return "{\"ok\":true}";
 }
 
+// ---------------------------------------------------------------------------
+// 执行 shell 命令
+//
+// 设备无 `timeout` 命令，因此这里用 fork + pipe + poll 自己实现超时：
+//   子进程：pipe 到 stdout/stderr（合并），execl("/bin/sh","sh","-c",cmd)
+//   父进程：poll 读，超过 deadline 就 kill(SIGKILL) 整组，再 waitpid 回收
+// 输出上限 256KB（防大输出打爆内存）；超限即停读并标记 truncated。
+// ---------------------------------------------------------------------------
+std::string DeepSeekWorker::execCommand(const std::string &cmd, int timeoutMs) const
+{
+    const size_t kMaxOutput = 262144; // 256KB
+
+    int tmo = timeoutMs;
+    if (tmo <= 0) tmo = 15000;
+    if (tmo > 300000) tmo = 300000; // 上限 5 分钟，防止 AI 传超大值挂死
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0)
+        return "{\"code\":-1,\"output\":\"创建管道失败\",\"timedOut\":false,\"truncated\":false}";
+
+    pid_t pid = fork();
+    if (pid < 0)
+    {
+        ::close(pipefd[0]);
+        ::close(pipefd[1]);
+        return "{\"code\":-1,\"output\":\"fork 失败\",\"timedOut\":false,\"truncated\":false}";
+    }
+
+    if (pid == 0)
+    {
+        // ---- 子进程 ----
+        // 新进程组：超时时可整组 kill，避免杀掉父进程自己
+        setpgid(0, 0);
+        ::close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO); // stderr 合并进同一管道
+        ::close(pipefd[1]);
+        // stdin 重定向到 /dev/null：防止命令（如 cat）等待输入挂住
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0)
+        {
+            dup2(devnull, STDIN_FILENO);
+            if (devnull > STDIN_FILENO) ::close(devnull);
+        }
+        execl("/bin/sh", "sh", "-c", cmd.c_str(), (char *)nullptr);
+        _exit(127); // exec 失败
+    }
+
+    // ---- 父进程 ----
+    setpgid(pid, pid); // 与子进程竞争设置，任一成功即可
+    ::close(pipefd[1]);
+
+    std::string out;
+    bool timedOut = false;
+    bool truncated = false;
+    uint64_t deadline = nowMs() + (uint64_t)tmo;
+    bool eof = false;
+
+    while (!eof)
+    {
+        int64_t remain = (int64_t)(deadline - nowMs());
+        if (remain <= 0)
+        {
+            timedOut = true;
+            break;
+        }
+        struct pollfd pfd;
+        pfd.fd = pipefd[0];
+        pfd.events = POLLIN;
+        int pr = poll(&pfd, 1, (int)(remain > 200 ? 200 : remain));
+        if (pr < 0)
+        {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) continue; // 超时片，回循环顶部检查 deadline
+
+        char buf[4096];
+        ssize_t n = ::read(pipefd[0], buf, sizeof buf);
+        if (n > 0)
+        {
+            if (out.size() + (size_t)n > kMaxOutput)
+            {
+                out.append(buf, kMaxOutput - out.size());
+                truncated = true;
+                break; // 不再读，直接进入清理
+            }
+            out.append(buf, (size_t)n);
+        }
+        else if (n == 0)
+        {
+            eof = true; // 写端关闭
+        }
+        else if (errno != EINTR)
+        {
+            break;
+        }
+    }
+
+    // 超时/截断：终止整个进程组（子进程可能还开着孙进程）
+    int status = 0;
+    if (timedOut || truncated)
+    {
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL);
+    }
+    // 回收：必须 waitpid，否则留僵尸进程。
+    // 注意顺序——waitpid 必须在 close(pipefd[0]) 之前、且主循环已读到 EOF 或
+    // 已决定放弃读取；反过来（先 close 再 read）会读到无效 fd。
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { /* 重试 */ }
+    ::close(pipefd[0]);
+
+    // 退出码：正常退出用 exit code；被信号杀死用 128+signal
+    int code = -1;
+    if (WIFEXITED(status))
+        code = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status))
+        code = 128 + WTERMSIG(status);
+
+    // 组装 JSON（输出需转义）
+    std::string note;
+    if (timedOut)
+        note = "\\n[命令超时（" + std::to_string(tmo / 1000) + " 秒），已强制终止]";
+    else if (truncated)
+        note = "\\n[输出过长，已截断]";
+
+    std::string json = "{\"code\":" + std::to_string(code) +
+                       ",\"output\":\"" + JVal::escape(out) + note +
+                       "\",\"timedOut\":" + (timedOut ? "true" : "false") +
+                       ",\"truncated\":" + (truncated ? "true" : "false") + "}";
+    return json;
+}
+
 // 诊断日志（见头文件说明）：追加写入，失败静默，绝不抛
 std::string DeepSeekWorker::debugLog(const std::string &text) const
 {
@@ -1170,6 +1321,12 @@ std::string DeepSeekWorker::chat(const std::string &requestJson) const
     payload.obj.push_back({"messages", *msgs});
     const JVal *mt = root.find("max_tokens");
     if (mt != nullptr && mt->type == JVal::NUM) payload.obj.push_back({"max_tokens", *mt});
+    // function calling：tools / tool_choice 原样透传（是否启用由 JS 侧决定）
+    const JVal *tools = root.find("tools");
+    if (tools != nullptr && tools->type == JVal::ARR && !tools->arr.empty())
+        payload.obj.push_back({"tools", *tools});
+    const JVal *tchoice = root.find("tool_choice");
+    if (tchoice != nullptr) payload.obj.push_back({"tool_choice", *tchoice});
     payload.obj.push_back({"stream", JVal::mkBool(false)});
     std::string payloadJson = payload.dump();
 
@@ -1194,6 +1351,15 @@ std::string DeepSeekWorker::chat(const std::string &requestJson) const
     JVal body = JVal::parse(resp.body);
     if (resp.status >= 200 && resp.status < 300)
     {
+        // 模型要求调用工具：优先返回 tool_calls（可能同时带 content 说明）
+        std::string toolCalls;
+        if (extractToolCalls(body, toolCalls))
+        {
+            std::string content;
+            extractContent(body, content);
+            return "{\"ok\":true,\"tool_calls\":" + toolCalls +
+                   ",\"content\":\"" + JVal::escape(content) + "\"}";
+        }
         std::string content;
         if (extractContent(body, content) && !content.empty())
             return buildOk(content);
