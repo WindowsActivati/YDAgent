@@ -164,9 +164,20 @@ export async function runWithTools(messages, handlers) {
       opts.tools = TOOL_DEFS;
       opts.tool_choice = 'auto';
     }
+    // 逐字回显：把增量透传给 UI（UI 负责节流与渲染）
+    if (h.onDelta) opts.onDelta = h.onDelta;
 
     const res = await api.chatRaw(messages, opts);
     checkAbort();
+
+    // 一轮结束：告诉 UI 本轮结果，由它决定"这段文字定为最终答案"还是
+    // "只是调用工具前的说明、需要另起一个气泡继续"。
+    if (h.onRoundEnd) {
+      h.onRoundEnd({
+        hadToolCalls: !!(res.toolCalls && res.toolCalls.length),
+        content: res.content || '',
+      });
+    }
 
     // 无工具调用 → 这就是最终回答
     if (!res.toolCalls || !res.toolCalls.length) {
@@ -175,10 +186,8 @@ export async function runWithTools(messages, handlers) {
 
     const calls = normalizeToolCalls(res.toolCalls);
 
-    // 模型在调用工具前可能先说了句话（如"我先看一下磁盘占用"）
-    if (res.content && h.onAssistantText) h.onAssistantText(res.content);
-
     // 记录 assistant 的 tool_calls 消息（协议要求：tool 消息必须紧跟其 assistant）
+    // 说明文字已通过 onDelta 流进气泡，并已由 onRoundEnd 处理收尾，此处不重复插入。
     messages.push({
       role: 'assistant',
       content: res.content || '',

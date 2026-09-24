@@ -307,6 +307,9 @@ function ensureDeltaSubscription() {
 
 // 底层调用：返回 { content, toolCalls }，供 agent 循环使用（需要看到 tool_calls）。
 // 普通 UI 走 chat() / chatStream()，不需要关心这一层。
+//
+// 优先走**流式**通道：这样即使对话启用了工具，正文也是逐字到达的
+// （native 的 SSE 解析同时支持 content 增量与 tool_calls 增量）。
 export async function chatRaw(messages, opts) {
   const optsObj = opts || {};
   const signal = optsObj.signal || null;
@@ -320,16 +323,47 @@ export async function chatRaw(messages, opts) {
     if (optsObj.tool_choice) payload.tool_choice = optsObj.tool_choice;
   }
 
+  const body = Object.assign({}, payload, {
+    api_base_url: apiBaseUrl,
+    api_key: apiKey,
+    timeout_ms: CONFIG.requestTimeoutMs,
+  });
+  const bodyJson = JSON.stringify(body);
+  const onDelta = typeof optsObj.onDelta === 'function' ? optsObj.onDelta : null;
+
   let nativeError = null;
+
+  // 1) 流式（native ≥ 支持 chatStream 时）
+  if (typeof DeepSeek.chatStream === 'function') {
+    try {
+      ensureDeltaSubscription();
+      if (onDelta) deltaHandler = (t) => onDelta(t);
+      const raw = await withTimeout(
+        Promise.resolve(DeepSeek.chatStream(bodyJson)),
+        CONFIG.requestTimeoutMs + 10000
+      );
+      if (onDelta) deltaHandler = null;
+      const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (res && res.ok === true) {
+        return { content: res.content || '', toolCalls: res.tool_calls || null };
+      }
+      const err = (res && res.error) || {};
+      if (err.code !== NET_UNAVAILABLE) {
+        throw new ApiError(err.message || 'native 请求失败', err.code || 'native_error', err.status || 0);
+      }
+      nativeError = new ApiError(err.message || 'native 网络不可用', NET_UNAVAILABLE, 0);
+    } catch (e) {
+      if (onDelta) deltaHandler = null;
+      if (e instanceof ApiError && e.code !== NET_UNAVAILABLE) throw e;
+      nativeError = e;
+    }
+  }
+
+  // 2) 非流式（旧版 native 或流式失败）
   if (typeof DeepSeek.chat === 'function') {
     try {
-      const body = Object.assign({}, payload, {
-        api_base_url: apiBaseUrl,
-        api_key: apiKey,
-        timeout_ms: CONFIG.requestTimeoutMs,
-      });
       const raw = await withTimeout(
-        Promise.resolve(DeepSeek.chat(JSON.stringify(body))),
+        Promise.resolve(DeepSeek.chat(bodyJson)),
         CONFIG.requestTimeoutMs + 5000
       );
       const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -347,7 +381,7 @@ export async function chatRaw(messages, opts) {
     }
   }
 
-  // 回退到系统网络桥（不支持 function calling，仅普通对话）
+  // 3) 回退到系统网络桥（不支持 function calling，仅普通对话）
   const r = await netFallbackChat(payload, apiBaseUrl, apiKey, signal, nativeError ? nativeError.message : null);
   return { content: r.content || '', toolCalls: null };
 }

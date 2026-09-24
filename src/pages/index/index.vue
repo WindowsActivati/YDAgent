@@ -413,19 +413,23 @@ export default {
       const gen = ++this.generation;
       this.thinking = true;
 
-      // 流式：先放一个空气泡，增量往里追加（Vue2 对已存在属性赋值是响应式的）
-      const bubble = { role: 'assistant', content: '' };
-      this.messages.push(bubble);
-      const idx = this.messages.length - 1;
-      this.scrollToBottom();
+      // 每轮对话一个气泡：模型先说一段话 → 若要求调用工具，那段话就留在
+      // 自己的气泡里（作为"我要做什么"的说明），工具执行记录插在它后面，
+      // 然后下一轮再开新气泡。这样文字与操作按真实时序排列。
+      let bubble = null;
+      let lastScroll = 0;
+      const newBubble = () => {
+        bubble = { role: 'assistant', content: '' };
+        this.messages.push(bubble);
+        this.scrollToBottom();
+      };
+      newBubble();
 
       // 滚动节流：增量可能每几十毫秒一次，每次都滚会拖慢渲染
-      let lastScroll = 0;
       const onDelta = (text) => {
         if (this.destroyed || gen !== this.generation) return; // 过期请求的增量丢弃
-        const m = this.messages[idx];
-        if (m !== bubble) return; // 气泡已被替换（理论上不会）
-        m.content += text;
+        if (!bubble) return;
+        bubble.content += text;
         const now = Date.now();
         if (now - lastScroll > 120) {
           lastScroll = now;
@@ -433,51 +437,50 @@ export default {
         }
       };
 
+      const alive = () => !this.destroyed && gen === this.generation;
+
       try {
-        // 走 agent 循环：模型可以请求执行命令，每条都要用户确认。
-        // 模型调用工具时输出的说明文字作为独立气泡展示，最终回答写进 bubble。
+        // 走 agent 循环：模型可请求执行命令/读写文件，每个操作都要用户确认
         const reply = await runWithTools(
-          this.messages.filter((m) => m !== bubble), // 不含空气泡
+          this.messages.filter((m) => m !== bubble),
           {
             signal: { aborted: this.destroyed || gen !== this.generation },
-            onAssistantText: (text) => {
-              if (this.destroyed || gen !== this.generation) return;
-              if (text && text.trim()) {
-                // 插到当前气泡之前（保持时序：先说话，后执行命令）
-                const at = this.messages.indexOf(bubble);
-                this.messages.splice(at < 0 ? this.messages.length : at, 0, {
-                  role: 'assistant',
-                  content: text,
-                });
-                this.scrollToBottom();
+            onDelta,
+            // 每轮结束：若模型要继续调用工具，当前气泡定型（它只是说明文字），
+            // 下一轮另起气泡；否则当前气泡就是最终答案。
+            onRoundEnd: (info) => {
+              if (!alive()) return;
+              if (info.hadToolCalls) {
+                if (bubble && !bubble.content.trim()) {
+                  // 模型没说话直接调工具：移除空气泡，别留空白
+                  const at = this.messages.indexOf(bubble);
+                  if (at >= 0) this.messages.splice(at, 1);
+                }
+                newBubble();
+              } else {
+                if (bubble) bubble.content = info.content || bubble.content;
               }
             },
             onConfirm: (info) => this.askCommandPermission(info),
             onCommandStart: (info) => {
-              if (this.destroyed || gen !== this.generation) return;
-              const at = this.messages.indexOf(bubble);
-              this.messages.splice(at < 0 ? this.messages.length : at, 0, {
-                role: 'assistant',
-                content: '执行命令：' + info.command,
-                isCommand: true,
-              });
-              this.scrollToBottom();
+              if (!alive()) return;
+              this.insertNote('$ ' + info.command, bubble);
             },
             onCommandEnd: (info) => {
-              if (this.destroyed || gen !== this.generation) return;
+              if (!alive()) return;
               const r = info.result || {};
-              const head = '输出' + (r.code === 0 ? '' : '（退出码 ' + r.code + '）') + '：';
+              const head = r.code === 0 ? '输出：' : '输出（退出码 ' + r.code + '）：';
               const body = (r.output || '(无输出)').slice(0, 1200);
-              this.insertNote('$ ' + info.command + '\n' + head + '\n' + body, bubble);
+              this.insertNote(head + '\n' + body, bubble);
             },
             // 文件操作：记录到对话里，让用户看到 AI 动了哪些文件
             onFileStart: (info) => {
-              if (this.destroyed || gen !== this.generation) return;
+              if (!alive()) return;
               const verb = info.kind === 'read' ? '读取文件：' : '写入文件：';
               this.insertNote(verb + info.path, bubble);
             },
             onFileEnd: (info) => {
-              if (this.destroyed || gen !== this.generation) return;
+              if (!alive()) return;
               const r = info.result || {};
               if (info.kind === 'read') {
                 const body = (r.content || '(空)').slice(0, 1200);
@@ -491,26 +494,30 @@ export default {
             },
           }
         );
-        if (this.destroyed || gen !== this.generation) return;
-        bubble.content = reply;
+        if (!alive()) return;
+        if (bubble && !bubble.content.trim()) bubble.content = reply;
       } catch (e) {
-        if (this.destroyed || gen !== this.generation) return;
+        if (!alive()) return;
         const msg = e && e.message ? e.message : '请求失败，请稍后重试';
-        // 未配置：撤掉这个气泡，改为引导用户去设置（不是错误，是还没设置好）
+        // 未配置：撤掉空气泡，改为引导用户去设置（不是错误，是还没设置好）
         if (e && e.code === api.NOT_CONFIGURED) {
-          const bi = this.messages.indexOf(bubble);
-          if (bi >= 0) this.messages.splice(bi, 1);
+          if (bubble) {
+            const bi = this.messages.indexOf(bubble);
+            if (bi >= 0) this.messages.splice(bi, 1);
+          }
           this.warn(api.NOT_CONFIGURED_MSG);
           diag('未配置，已引导去设置页');
           this.onOpenSettings();
           return;
         }
-        if (bubble.content) {
+        if (bubble && bubble.content) {
           bubble.isError = true; // 已吐出部分内容：保留并标注中断
           diag('流式中断（已收到 ' + bubble.content.length + ' 字）: ' + msg);
-        } else {
+        } else if (bubble) {
           bubble.content = '⚠ ' + msg;
           bubble.isError = true;
+        } else {
+          this.messages.push({ role: 'assistant', content: '⚠ ' + msg, isError: true });
         }
       } finally {
         if (!this.destroyed && gen === this.generation) {

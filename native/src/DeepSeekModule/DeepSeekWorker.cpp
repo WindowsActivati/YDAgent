@@ -608,18 +608,33 @@ std::string statusCode(int status)
     return "http_error";
 }
 
-// 提取 choices[0].message.content（需为字符串且非空）
+// 提取 choices[0].message.content。
+// 注意：content 可以是 null（工具调用时常见）——此时视作空串但**仍算提取成功**，
+// 否则会被误判为「响应格式错误」。
 bool extractContent(const JVal &body, std::string &out)
 {
     if (body.type != JVal::OBJ) return false;
     const JVal *choices = body.find("choices");
     if (choices == nullptr || choices->type != JVal::ARR || choices->arr.empty()) return false;
     const JVal *msg = choices->at(0)->find("message");
-    if (msg == nullptr) return false;
+    if (msg == nullptr || msg->type != JVal::OBJ) return false;
     const JVal *content = msg->find("content");
-    if (content == nullptr || content->type != JVal::STR) return false;
+    if (content == nullptr) return false;       // 连字段都没有 → 格式异常
+    if (content->type == JVal::NUL) { out.clear(); return true; }  // null → 空串
+    if (content->type != JVal::STR) return false;
     out = content->str;
     return true;
+}
+
+// 提取 choices[0].finish_reason（"stop" / "length" / "tool_calls" / ...）
+std::string extractFinishReason(const JVal &body)
+{
+    if (body.type != JVal::OBJ) return "";
+    const JVal *choices = body.find("choices");
+    if (choices == nullptr || choices->type != JVal::ARR || choices->arr.empty()) return "";
+    const JVal *fr = choices->at(0)->find("finish_reason");
+    if (fr == nullptr || fr->type != JVal::STR) return "";
+    return fr->str;
 }
 
 // 提取 choices[0].message.tool_calls（function calling）。
@@ -840,12 +855,49 @@ private:
 };
 
 // SSE 单行解析结果
+// 流式 tool_calls 增量：SSE 会把一个工具调用拆成多个片段陆续下发，
+// 需要按 index 累积（id/name 通常只出现在首片，arguments 分多片拼接）。
+struct ToolCallAcc
+{
+    std::string id;
+    std::string name;
+    std::string args;
+};
+
 struct SseDelta
 {
     bool done = false;       // 收到 [DONE]
     std::string content;     // 本行携带的正文增量
     std::string errorMsg;    // 服务端在流中下发的错误
+    std::string finishReason;
+
+    // 本行携带的工具调用片段：[{index, hasId, id, hasName, name, argsFragment}]
+    struct CallFrag
+    {
+        int index = 0;
+        bool hasId = false;
+        std::string id;
+        bool hasName = false;
+        std::string name;
+        std::string argsFragment;
+    };
+    std::vector<CallFrag> callFrags;
 };
+
+// 把累积的工具调用拼成 API 格式的 JSON 数组
+std::string buildToolCallsJson(const std::vector<ToolCallAcc> &accs)
+{
+    std::string out = "[";
+    for (size_t i = 0; i < accs.size(); i++)
+    {
+        if (i > 0) out += ",";
+        out += "{\"id\":\"" + JVal::escape(accs[i].id) + "\",\"type\":\"function\","
+               "\"function\":{\"name\":\"" + JVal::escape(accs[i].name) +
+               "\",\"arguments\":\"" + JVal::escape(accs[i].args) + "\"}}";
+    }
+    out += "]";
+    return out;
+}
 
 // 解析一行 SSE。返回 false = 该行无内容（空行/注释/心跳/无 delta）
 bool parseSseLine(const std::string &line, SseDelta &out)
@@ -873,15 +925,71 @@ bool parseSseLine(const std::string &line, SseDelta &out)
 
     const JVal *choices = v.find("choices");
     if (choices == nullptr || choices->type != JVal::ARR || choices->arr.empty()) return false;
+
+    bool useful = false;
+
+    // finish_reason 只出现在末尾块（"stop" / "length" / "tool_calls"）。
+    // 它常与**空的 delta** 出现在同一块（如 {"delta":{},"finish_reason":"stop"}），
+    // 因此这里必须单独置 useful——否则该块会被当作"无内容"丢弃，
+    // 导致后续无法区分"正常结束"与"被长度截断"。
+    const JVal *fr = choices->at(0)->find("finish_reason");
+    if (fr != nullptr && fr->type == JVal::STR && !fr->str.empty())
+    {
+        out.finishReason = fr->str;
+        useful = true;
+    }
+
     const JVal *delta = choices->at(0)->find("delta");
-    if (delta == nullptr) return false;
+    if (delta == nullptr || delta->type != JVal::OBJ) return useful;
+
+    // 正文增量
     const JVal *content = delta->find("content");
     if (content != nullptr && content->type == JVal::STR && !content->str.empty())
     {
         out.content = content->str;
-        return true;
+        useful = true;
     }
-    return false; // 只有 role/finish_reason 的块
+
+    // 工具调用增量（可能分多片下发，按 index 累积）
+    const JVal *tcs = delta->find("tool_calls");
+    if (tcs != nullptr && tcs->type == JVal::ARR)
+    {
+        for (size_t k = 0; k < tcs->arr.size(); k++)
+        {
+            const JVal *tc = tcs->at(k);
+            if (tc == nullptr || tc->type != JVal::OBJ) continue;
+            SseDelta::CallFrag frag;
+
+            const JVal *idx = tc->find("index");
+            if (idx != nullptr && idx->type == JVal::NUM) frag.index = (int)idx->num;
+
+            const JVal *id = tc->find("id");
+            if (id != nullptr && id->type == JVal::STR && !id->str.empty())
+            {
+                frag.hasId = true;
+                frag.id = id->str;
+            }
+
+            const JVal *fn = tc->find("function");
+            if (fn != nullptr && fn->type == JVal::OBJ)
+            {
+                const JVal *nm = fn->find("name");
+                if (nm != nullptr && nm->type == JVal::STR && !nm->str.empty())
+                {
+                    frag.hasName = true;
+                    frag.name = nm->str;
+                }
+                const JVal *args = fn->find("arguments");
+                if (args != nullptr && args->type == JVal::STR && !args->str.empty())
+                    frag.argsFragment = args->str;
+            }
+
+            out.callFrags.push_back(frag);
+            useful = true;
+        }
+    }
+
+    return useful; // 只有 role 的块返回 false
 }
 
 // ---------------------------------------------------------------------------
@@ -892,7 +1000,8 @@ bool parseSseLine(const std::string &line, SseDelta &out)
 bool httpPostStream(TlsClient &tls, const std::string &host, int port, const std::string &path,
                     const std::string &apiKey, const std::string &payload,
                     const DeepSeekWorker::DeltaFn &onDelta,
-                    int &statusOut, std::string &fullText, std::string &errOut)
+                    int &statusOut, std::string &fullText, std::string &errOut,
+                    std::vector<ToolCallAcc> &toolCalls, std::string &finishReason)
 {
     std::string req;
     req += "POST " + path + " HTTP/1.1\r\n";
@@ -961,6 +1070,19 @@ bool httpPostStream(TlsClient &tls, const std::string &host, int port, const std
         if (!parseSseLine(line, d)) continue;
 
         if (!d.errorMsg.empty()) { errOut = d.errorMsg; return false; }
+        if (!d.finishReason.empty()) finishReason = d.finishReason;
+
+        // 累积工具调用片段（同一 index 的多片拼在一起）
+        for (size_t k = 0; k < d.callFrags.size(); k++)
+        {
+            const SseDelta::CallFrag &frag = d.callFrags[k];
+            if (frag.index < 0 || frag.index > 64) continue; // 防御异常 index
+            while ((int)toolCalls.size() <= frag.index) toolCalls.push_back(ToolCallAcc());
+            ToolCallAcc &acc = toolCalls[frag.index];
+            if (frag.hasId) acc.id = frag.id;
+            if (frag.hasName) acc.name = frag.name;
+            acc.args += frag.argsFragment;
+        }
 
         if (!d.content.empty())
         {
@@ -975,8 +1097,19 @@ bool httpPostStream(TlsClient &tls, const std::string &host, int port, const std
         if (d.done) break;
     }
 
-    // 部分网关不发 [DONE] 直接关流：只要收到过正文就算成功
-    if (fullText.empty())
+    // 丢弃未补全的空工具调用槽（index 跳号时会产生）
+    for (size_t i = 0; i < toolCalls.size();)
+    {
+        if (toolCalls[i].name.empty() && toolCalls[i].args.empty())
+            toolCalls.erase(toolCalls.begin() + i);
+        else
+            i++;
+    }
+
+    // 正常收尾有两种形态：只回正文，或只回工具调用（正文可为空）。
+    // 两者都没有才算异常——注意不能把"空正文"直接当错误：模型调用工具时
+    // 正文本来就是空的，旧逻辑会误报「响应缺少 choices[0].message.content」。
+    if (fullText.empty() && toolCalls.empty())
     {
         errOut = "流式响应为空";
         return false;
@@ -1562,10 +1695,23 @@ std::string DeepSeekWorker::chat(const std::string &requestJson) const
                    ",\"content\":\"" + JVal::escape(content) + "\"}";
         }
         std::string content;
+        // content 为 null/空也算"提取成功"——只有连字段都没有才是格式异常。
+        // 旧写法要求非空，导致被截断或空回复时误报「响应缺少 choices[0].message.content」。
         if (extractContent(body, content) && !content.empty())
             return buildOk(content);
 
-        std::string emsg = "响应缺少 choices[0].message.content";
+        std::string fr = extractFinishReason(body);
+        std::string emsg;
+        if (extractContent(body, content))
+        {
+            // 字段存在但内容为空：区分截断与模型空回复
+            emsg = (fr == "length") ? "回复被长度限制截断（未产生内容）"
+                                    : "模型返回了空回复，请重试";
+        }
+        else
+        {
+            emsg = "响应格式不符合预期（缺少 choices[0].message）";
+        }
         extractError(body, emsg);
         return buildErr("bad_response", emsg, resp.status);
     }
@@ -1612,6 +1758,12 @@ std::string DeepSeekWorker::chatStream(const std::string &requestJson, const Del
     payload.obj.push_back({"messages", *msgs});
     const JVal *mt = root.find("max_tokens");
     if (mt != nullptr && mt->type == JVal::NUM) payload.obj.push_back({"max_tokens", *mt});
+    // tools 透传（启用工具调用时，流式响应里会下发 tool_calls 增量）
+    const JVal *tools = root.find("tools");
+    if (tools != nullptr && tools->type == JVal::ARR && !tools->arr.empty())
+        payload.obj.push_back({"tools", *tools});
+    const JVal *tchoice = root.find("tool_choice");
+    if (tchoice != nullptr) payload.obj.push_back({"tool_choice", *tchoice});
     payload.obj.push_back({"stream", JVal::mkBool(true)});
     std::string payloadJson = payload.dump();
 
@@ -1624,9 +1776,10 @@ std::string DeepSeekWorker::chatStream(const std::string &requestJson, const Del
         return buildErr("unavailable", err, 0);
 
     int status = 0;
-    std::string fullText, bodyErr;
+    std::string fullText, bodyErr, finishReason;
+    std::vector<ToolCallAcc> toolCalls;
     if (!httpPostStream(tls, url.host, url.port, path, apiKey, payloadJson, onDelta,
-                        status, fullText, bodyErr))
+                        status, fullText, bodyErr, toolCalls, finishReason))
     {
         if (bodyErr == "timeout") return buildErr("timeout", "请求超时", 0);
         return buildErr("unavailable", bodyErr.empty() ? "流式读取失败" : bodyErr, 0);
@@ -1634,8 +1787,20 @@ std::string DeepSeekWorker::chatStream(const std::string &requestJson, const Del
 
     if (status >= 200 && status < 300)
     {
+        // 工具调用：返回 tool_calls 给 JS 侧走授权流程（正文此时通常为空）
+        if (!toolCalls.empty())
+        {
+            return "{\"ok\":true,\"tool_calls\":" + buildToolCallsJson(toolCalls) +
+                   ",\"content\":\"" + JVal::escape(fullText) +
+                   "\",\"finish_reason\":\"" + JVal::escape(finishReason) + "\"}";
+        }
+        // 正文为空但被长度截断：明确告知，避免误判为"格式错误"
         if (fullText.empty())
+        {
+            if (finishReason == "length")
+                return buildErr("bad_response", "回复被长度限制截断（未产生内容）", status);
             return buildErr("bad_response", "流式响应没有正文", status);
+        }
         return buildOk(fullText);
     }
 

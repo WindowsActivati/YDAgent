@@ -70,6 +70,10 @@ export const DeepSeek = {
       model: req.model,
       messages: req.messages,
       max_tokens: req.max_tokens,
+      // 工具定义透传（与 native 一致），便于在模拟器里调试工具调用流程
+      ...(Array.isArray(req.tools) && req.tools.length
+        ? { tools: req.tools, ...(req.tool_choice ? { tool_choice: req.tool_choice } : {}) }
+        : {}),
       stream: false,
     });
 
@@ -95,14 +99,32 @@ export const DeepSeek = {
           data.choices.length
         ) {
           const first = data.choices[0];
-          let content = null;
-          if (first && first.message && typeof first.message.content === 'string') {
-            content = first.message.content;
-          } else if (first && typeof first.text === 'string') {
-            content = first.text;
+          const msg = (first && first.message) || null;
+
+          // 工具调用：与 native 一致，返回 {ok:true, tool_calls, content}
+          // （此时 content 通常为空，不能当作错误）
+          if (msg && Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
+            return JSON.stringify({
+              ok: true,
+              tool_calls: msg.tool_calls,
+              content: typeof msg.content === 'string' ? msg.content : '',
+            });
           }
-          if (content != null) return buildOk(content);
-          return buildErr('bad_response', '响应缺少 choices[0].message.content', resp.status);
+
+          let content = null;
+          if (msg && typeof msg.content === 'string') content = msg.content;
+          else if (first && typeof first.text === 'string') content = first.text;
+
+          if (content != null && content !== '') return buildOk(content);
+          if (content === '') {
+            const fr = first && first.finish_reason;
+            return buildErr(
+              'bad_response',
+              fr === 'length' ? '回复被长度限制截断（未产生内容）' : '模型返回了空回复，请重试',
+              resp.status
+            );
+          }
+          return buildErr('bad_response', '响应格式不符合预期（缺少 choices[0].message）', resp.status);
         }
         const msg =
           (data && data.error && (data.error.message || data.error.type)) ||
@@ -187,12 +209,60 @@ DeepSeek.debugLog = function (text) {
   return JSON.stringify({ ok: true });
 };
 
-// 流式 mock：真机走 SSE + publish('delta')；PC 上没有 native 的 publish，
-// 这里用「一次性返回」模拟（chatStream 内部会自动退化为 chat）。
-// 注意：故意不实现 chatStream，让 deepseek-api.js 走它的退化分支，
-// 保证 mock 与「native 不支持流式」这条路径行为一致。
-DeepSeek.on = function () {
-  return 0; // 占位，避免 ensureDeltaSubscription 报错
+// 流式 mock：真机走 SSE + publish('delta')；PC 上用 setTimeout 逐段模拟，
+// 这样在模拟器里也能看到逐字效果与工具调用流程。
+// 注意：必须真实实现（而非省略），否则 chatRaw 会一直走非流式分支，
+// 导致「流式 + 工具调用」这条路径在 PC 上永远测不到。
+const mockListeners = {}; // topic -> [cb]
+
+DeepSeek.on = function (topic, cb) {
+  if (typeof cb !== 'function') return 0;
+  if (!mockListeners[topic]) mockListeners[topic] = [];
+  mockListeners[topic].push(cb);
+  return mockListeners[topic].length; // 返回 token
+};
+
+function mockPublish(topic, payload) {
+  const list = mockListeners[topic] || [];
+  for (let i = 0; i < list.length; i++) {
+    try {
+      list[i](payload);
+    } catch (e) {
+      /* 单个订阅者异常不影响其他 */
+    }
+  }
+}
+
+// 把整段文字按小块推送，模拟流式
+function mockEmitDelta(text, done) {
+  const step = 3; // 每次 3 个字符，足够看出逐字效果
+  let i = 0;
+  const timer = setInterval(() => {
+    if (i >= text.length) {
+      clearInterval(timer);
+      done();
+      return;
+    }
+    mockPublish('delta', { text: text.slice(i, i + step) });
+    i += step;
+  }, 30);
+}
+
+DeepSeek.chatStream = function (requestJson) {
+  return DeepSeek.chat(requestJson).then((raw) => {
+    let res;
+    try {
+      res = JSON.parse(raw);
+    } catch (e) {
+      return raw; // 原样返回（解析失败时上层会报错）
+    }
+    // 把结果改写成"流式形态"：逐段推送 content，最后返回完整 JSON
+    const content = (res && res.ok && typeof res.content === 'string') ? res.content : '';
+    if (!content) return raw; // 工具调用 / 错误：无需推送增量
+    return new Promise((resolve) => {
+      mockEmitDelta(content, () => resolve(raw));
+    });
+  });
 };
 
 // 本地持久化 mock（真机走 native 文件 IO，PC 上用 localStorage）
