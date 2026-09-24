@@ -1,7 +1,7 @@
 <template>
   <view class="root">
     <!-- ===================== 聊天页 ===================== -->
-    <view class="chat-page" v-if="!settingsOpen && !confirmCmd">
+    <view class="chat-page" v-if="!settingsOpen && !confirm">
     <!-- 顶部栏 -->
     <view class="header">
       <!-- 菜单键：打开会话列表 / 新建对话 -->
@@ -116,29 +116,50 @@
       </scroller>
     </view>
 
-    <!-- ===================== 命令授权页 =====================
-         AI 提议执行 shell 命令时必须经用户逐条确认。这是唯一的执行闸门，
+    <!-- ===================== 操作授权页 =====================
+         AI 提议执行命令 / 读写文件时必须经用户逐条确认。这是唯一的执行闸门，
          不能被绕过——任何"自动放行"改动都等于把 root 权限交给模型。 -->
-    <view class="settings-page" v-if="confirmCmd">
+    <view class="settings-page" v-if="confirm">
       <view class="settings-header">
-        <text class="settings-title">执行命令？</text>
+        <text class="settings-title">{{ confirmTitle }}</text>
         <view class="danger-badge" v-if="confirmDangers.length">
-          <text class="danger-badge-text">危险</text>
+          <text class="danger-badge-text">注意</text>
         </view>
       </view>
 
       <scroller class="settings-body">
-        <text class="field-label" v-if="confirmReason">AI 的理由</text>
-        <text class="confirm-reason" v-if="confirmReason">{{ confirmReason }}</text>
+        <text class="field-label" v-if="confirm.reason">AI 的理由</text>
+        <text class="confirm-reason" v-if="confirm.reason">{{ confirm.reason }}</text>
 
-        <text class="field-label field-label-gap">将要执行</text>
-        <view class="cmd-box">
-          <text class="cmd-text">{{ confirmCmd }}</text>
-        </view>
+        <!-- 命令：显示命令原文 -->
+        <template v-if="confirm.kind === 'command'">
+          <text class="field-label field-label-gap">将要执行</text>
+          <view class="cmd-box">
+            <text class="cmd-text">{{ confirm.command }}</text>
+          </view>
+        </template>
 
-        <!-- 危险命令：红字警告，但仍允许执行（用户可保留高级操作自由） -->
+        <!-- 读文件：显示路径 -->
+        <template v-if="confirm.kind === 'read'">
+          <text class="field-label field-label-gap">将要读取</text>
+          <view class="cmd-box">
+            <text class="cmd-text">{{ confirm.path }}</text>
+          </view>
+        </template>
+
+        <!-- 写文件：显示路径 + 内容预览 -->
+        <template v-if="confirm.kind === 'write'">
+          <text class="field-label field-label-gap">
+            {{ confirm.isNew ? '新建文件' : '覆盖文件' }} {{ confirm.path }}（{{ confirm.bytes }} 字节）
+          </text>
+          <view class="cmd-box">
+            <text class="cmd-text">{{ contentPreview }}</text>
+          </view>
+        </template>
+
+        <!-- 风险/影响提示：红字警告，但仍允许执行（用户保留高级操作自由） -->
         <view class="danger-note" v-if="confirmDangers.length">
-          <text class="danger-note-title">⚠ 这条命令有风险</text>
+          <text class="danger-note-title">⚠ 请注意</text>
           <text class="danger-note-item" v-for="(d, i) in confirmDangers" :key="i">· {{ d }}</text>
         </view>
       </scroller>
@@ -153,7 +174,7 @@
           :class="{ 'allow-btn-danger': confirmDangers.length > 0 }"
           @click="onAllowCommand"
         >
-          <text class="allow-btn-text">允许执行</text>
+          <text class="allow-btn-text">允许</text>
         </view>
       </view>
     </view>
@@ -244,9 +265,9 @@ export default {
       menuOpen: false,
       sessions: [],
       activeId: '',
-      // 命令授权（AI 每次要执行命令都会填这里并弹出确认页）
-      confirmCmd: '',
-      confirmReason: '',
+      // 操作授权（AI 每次要执行命令/读写文件都会填这里并弹出确认页）
+      // confirm: { kind:'command'|'read'|'write', command?, path?, content?, bytes?, isNew?, reason }
+      confirm: null,
       confirmDangers: [],
       _confirmResolve: null,
     };
@@ -275,6 +296,20 @@ export default {
     activeTitle() {
       const s = this.sessions.find((x) => x.id === this.activeId);
       return (s && s.title) || '词典笔 AI 助手';
+    },
+    // 授权页标题随操作类型变化
+    confirmTitle() {
+      if (!this.confirm) return '';
+      if (this.confirm.kind === 'command') return '执行命令？';
+      if (this.confirm.kind === 'read') return '读取文件？';
+      return this.confirm.isNew ? '新建文件？' : '覆盖文件？';
+    },
+    // 写入内容预览：只显示前若干行，避免长文件把授权页撑爆
+    contentPreview() {
+      const c = (this.confirm && this.confirm.content) || '';
+      const lines = c.split('\n');
+      const head = lines.slice(0, 12).join('\n');
+      return lines.length > 12 ? head + '\n…（共 ' + lines.length + ' 行）' : head;
     },
   },
 
@@ -433,13 +468,26 @@ export default {
               const r = info.result || {};
               const head = '输出' + (r.code === 0 ? '' : '（退出码 ' + r.code + '）') + '：';
               const body = (r.output || '(无输出)').slice(0, 1200);
-              const at = this.messages.indexOf(bubble);
-              this.messages.splice(at < 0 ? this.messages.length : at, 0, {
-                role: 'assistant',
-                content: head + '\n' + body,
-                isCommand: true,
-              });
-              this.scrollToBottom();
+              this.insertNote('$ ' + info.command + '\n' + head + '\n' + body, bubble);
+            },
+            // 文件操作：记录到对话里，让用户看到 AI 动了哪些文件
+            onFileStart: (info) => {
+              if (this.destroyed || gen !== this.generation) return;
+              const verb = info.kind === 'read' ? '读取文件：' : '写入文件：';
+              this.insertNote(verb + info.path, bubble);
+            },
+            onFileEnd: (info) => {
+              if (this.destroyed || gen !== this.generation) return;
+              const r = info.result || {};
+              if (info.kind === 'read') {
+                const body = (r.content || '(空)').slice(0, 1200);
+                this.insertNote('内容（' + (r.size || 0) + ' 字节）：\n' + body, bubble);
+              } else {
+                this.insertNote(
+                  r.ok ? '已写入 ' + (r.bytes || 0) + ' 字节\n' + (r.diff || '') : '写入失败',
+                  bubble
+                );
+              }
             },
           }
         );
@@ -473,36 +521,55 @@ export default {
       }
     },
 
-    // ---------- 命令授权 ----------
+    // 在最终回答气泡之前插入一条"过程记录"（命令执行、文件读写），
+    // 保持时序：AI 说的话 / 做的事按发生顺序排列，最终回答在最后。
+    insertNote(text, bubble) {
+      const at = this.messages.indexOf(bubble);
+      this.messages.splice(at < 0 ? this.messages.length : at, 0, {
+        role: 'assistant',
+        content: text,
+        isCommand: true,
+      });
+      this.scrollToBottom();
+    },
+
+    // ---------- 操作授权 ----------
     // 显示确认页并等待用户决定。返回 Promise<boolean>。
-    // ⚠ 这是命令执行的唯一闸门：runWithTools 里的任何命令都会经过这里。
+    // ⚠ 这是命令执行与文件读写的唯一闸门：agent 循环里的每个操作都经过这里。
     askCommandPermission(info) {
       return new Promise((resolve) => {
-        this.confirmCmd = info.command;
-        this.confirmReason = info.reason || '';
+        this.confirm = {
+          kind: info.kind || 'command',
+          command: info.command || '',
+          path: info.path || '',
+          content: info.content || '',
+          bytes: info.bytes || 0,
+          isNew: !!info.isNew,
+          reason: info.reason || '',
+        };
         this.confirmDangers = info.dangers || [];
         this._confirmResolve = resolve;
-        diag('待授权命令: ' + info.command + (this.confirmDangers.length ? '（危险）' : ''));
+        const what = info.kind === 'command' ? info.command : info.path;
+        diag('待授权: ' + (info.kind || 'command') + ' ' + what +
+             (this.confirmDangers.length ? '（有风险提示）' : ''));
       });
     },
 
     onAllowCommand() {
       const r = this._confirmResolve;
       this._confirmResolve = null;
-      this.confirmCmd = '';
-      this.confirmReason = '';
+      this.confirm = null;
       this.confirmDangers = [];
-      diag('用户允许执行');
+      diag('用户允许');
       if (r) r(true);
     },
 
     onDenyCommand() {
       const r = this._confirmResolve;
       this._confirmResolve = null;
-      this.confirmCmd = '';
-      this.confirmReason = '';
+      this.confirm = null;
       this.confirmDangers = [];
-      diag('用户拒绝执行');
+      diag('用户拒绝');
       if (r) r(false);
     },
 

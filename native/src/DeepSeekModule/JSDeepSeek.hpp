@@ -49,6 +49,13 @@ public:
     // ⚠ 安全判断（危险命令识别、用户授权）在 JS 侧，本层只保证超时与回收。
     void execCommand(JQUTIL_NS::JQAsyncInfo &info);
 
+    // 异步 Promise：文件读写（AI 工具调用）
+    //   readFile(path, maxBytes?)  → {"ok","content","size","truncated"}
+    //   writeFile(path, content)   → {"ok","bytes","created","diff"}
+    // ⚠ 路径白名单与用户授权在 JS 侧（src/services/tools.js）。
+    void readFile(JQUTIL_NS::JQAsyncInfo &info);
+    void writeFile(JQUTIL_NS::JQAsyncInfo &info);
+
     // 同步：本地持久化（native 直读直写 app 私有 data 目录）
     // 真机 $falcon.jsapi.storage.setStorage 的 Promise 不 resolve（实测自检日志
     // 一行不出、loadHistory 卡死），故改用 native 文件 IO，行为完全可控。

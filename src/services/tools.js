@@ -16,6 +16,42 @@
 
 import { DeepSeek } from 'deepseek';
 
+// 可写路径白名单：只有这些前缀下的文件允许读写。
+// 理由：设备 root 权限且很多路径是系统关键文件（/etc/passwd、/lib/*.so、
+// 开机脚本…），一个误改就可能导致系统异常或无法启动。
+// 只读操作（read_file）也限制在这里，避免模型被诱导读取设备密钥类文件。
+export const WRITABLE_PREFIXES = ['/userdata/', '/tmp/', '/userdisk/'];
+
+// 明确的保护路径（即使前缀命中也不允许，如 app 自身存储目录可放行但系统库不放）
+const DENIED_PATTERNS = [
+  /^\/(etc|lib|lib32|bin|sbin|usr|oem|proc|sys|dev|boot)\//,
+  /\/\.\.\//, // 路径穿越
+];
+
+// 校验文件路径。返回 { ok, path } 或 { ok:false, reason }
+export function validatePath(raw) {
+  const p = String(raw == null ? '' : raw).trim();
+  if (!p) return { ok: false, reason: '路径为空' };
+  if (p.length > 1024) return { ok: false, reason: '路径过长' };
+  if (p[0] !== '/') return { ok: false, reason: '必须是绝对路径' };
+  // 拒绝路径穿越（避免 /tmp/../../etc/passwd 这类绕过）
+  for (let i = 0; i < DENIED_PATTERNS.length; i++) {
+    if (DENIED_PATTERNS[i].test(p)) return { ok: false, reason: '路径包含不允许的片段（' + p + '）' };
+  }
+  let allowed = false;
+  for (let i = 0; i < WRITABLE_PREFIXES.length; i++) {
+    if (p.indexOf(WRITABLE_PREFIXES[i]) === 0) { allowed = true; break; }
+  }
+  if (!allowed) {
+    return {
+      ok: false,
+      reason: '只允许访问 ' + WRITABLE_PREFIXES.join(' / ') + ' 下的文件（系统目录受保护）',
+    };
+  }
+  if (p.endsWith('/')) return { ok: false, reason: '路径不能以 / 结尾（这不是文件）' };
+  return { ok: true, path: p };
+}
+
 // 工具定义（OpenAI function calling 格式，DeepSeek 兼容）
 export const TOOL_DEFS = [
   {
@@ -41,6 +77,42 @@ export const TOOL_DEFS = [
           },
         },
         required: ['command'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description:
+        '读取一个文本文件的内容。只能读 /userdata、/userdisk、/tmp 下的文件' +
+        '（系统目录受保护）。写入大段内容时优先用 write_file 而不是 shell 重定向。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '文件绝对路径，例如 /tmp/test.txt' },
+          reason: { type: 'string', description: '一句话说明为什么读这个文件' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description:
+        '把内容写入文件（覆盖写入；文件不存在则新建，父目录会自动创建）。' +
+        '只能写 /userdata、/userdisk、/tmp 下的文件（系统目录受保护）。' +
+        '用户会看到改动 diff 后才决定是否允许。适合写脚本、配置、笔记等。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '文件绝对路径，例如 /tmp/demo.sh' },
+          content: { type: 'string', description: '要写入的完整文件内容' },
+          reason: { type: 'string', description: '一句话说明为什么写这个文件' },
+        },
+        required: ['path', 'content'],
       },
     },
   },
@@ -129,4 +201,66 @@ export function formatResultForModel(res) {
   if (res && res.timedOut) return output || '命令执行超时';
   const head = '命令失败（退出码 ' + code + '）';
   return output ? head + ':\n' + output : head;
+}
+
+// ---------------------------------------------------------------------------
+// 文件读写（调用方必须已完成路径校验与用户授权）
+// ---------------------------------------------------------------------------
+
+export async function readFile(path, maxBytes) {
+  if (typeof DeepSeek.readFile !== 'function') {
+    return { ok: false, error: '当前 native 插件不支持读文件' };
+  }
+  try {
+    const raw = await Promise.resolve(DeepSeek.readFile(path, maxBytes || 262144));
+    const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!res || typeof res !== 'object') return { ok: false, error: '返回数据异常' };
+    return {
+      ok: !!res.ok,
+      content: typeof res.content === 'string' ? res.content : '',
+      size: typeof res.size === 'number' ? res.size : 0,
+      truncated: !!res.truncated,
+      error: res.error || '',
+    };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || '读取失败' };
+  }
+}
+
+export async function writeFile(path, content) {
+  if (typeof DeepSeek.writeFile !== 'function') {
+    return { ok: false, error: '当前 native 插件不支持写文件' };
+  }
+  try {
+    const raw = await Promise.resolve(DeepSeek.writeFile(path, String(content)));
+    const res = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!res || typeof res !== 'object') return { ok: false, error: '返回数据异常' };
+    return {
+      ok: !!res.ok,
+      bytes: typeof res.bytes === 'number' ? res.bytes : 0,
+      created: !!res.created,
+      diff: typeof res.diff === 'string' ? res.diff : '',
+      error: res.error || '',
+    };
+  } catch (e) {
+    return { ok: false, error: (e && e.message) || '写入失败' };
+  }
+}
+
+// 读取结果 → 给模型看的文本
+export function formatReadResult(res) {
+  if (!res || !res.ok) return '读取失败：' + ((res && res.error) || '未知错误');
+  const body = res.content || '';
+  const tail = res.truncated ? '\n[文件较大，仅显示前 ' + body.length + ' 字节，共 ' + res.size + ' 字节]' : '';
+  return body || '(空文件)' + tail;
+}
+
+// 写入结果 → 给模型看的文本
+export function formatWriteResult(path, res) {
+  if (!res || !res.ok) return '写入失败：' + ((res && res.error) || '未知错误');
+  return (
+    (res.created ? '已新建文件 ' : '已更新文件 ') +
+    path +
+    '（' + res.bytes + ' 字节）'
+  );
 }

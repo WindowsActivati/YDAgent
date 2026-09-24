@@ -141,6 +141,42 @@ DeepSeek.execCommand = function (cmd, timeoutMs) {
   );
 };
 
+// 文件读写 mock：用内存 Map 模拟，不触碰开发机文件系统
+const MOCK_FILES = new Map();
+
+DeepSeek.readFile = function (path, maxBytes) {
+  const key = String(path);
+  if (!MOCK_FILES.has(key)) {
+    return Promise.resolve(JSON.stringify({ ok: false, error: '文件不存在（模拟器）' }));
+  }
+  const content = MOCK_FILES.get(key);
+  return Promise.resolve(
+    JSON.stringify({ ok: true, content, size: content.length, truncated: false })
+  );
+};
+
+DeepSeek.writeFile = function (path, content) {
+  const key = String(path);
+  const created = !MOCK_FILES.has(key);
+  const old = MOCK_FILES.get(key) || '';
+  MOCK_FILES.set(key, String(content));
+  try {
+    if (typeof console !== 'undefined' && console.log) {
+      console.log('[mock-writeFile] ' + key + ' (' + String(content).length + ' 字节，' +
+                  (created ? '新建' : '覆盖') + ')');
+    }
+  } catch (e) {
+    /* 忽略 */
+  }
+  // 简化 diff：只报行数变化（模拟器不需要真实 diff）
+  const diff = created
+    ? '(新建文件，共 ' + String(content).split('\n').length + ' 行)'
+    : '(覆盖：原 ' + old.length + ' 字节 → 现 ' + String(content).length + ' 字节)';
+  return Promise.resolve(
+    JSON.stringify({ ok: true, bytes: String(content).length, created, diff })
+  );
+};
+
 // 诊断日志（真机写 /tmp/deepseek_diag.log；PC 上打到 console）
 DeepSeek.debugLog = function (text) {
   try {

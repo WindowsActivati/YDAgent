@@ -45,6 +45,8 @@ extern JSValue createDeepSeekModule(JQModuleEnv *env)
     tpl->SetProtoMethodPromise("chat", &JSDeepSeek::chat);                // promise
     tpl->SetProtoMethodPromise("chatStream", &JSDeepSeek::chatStream);    // promise + publish('delta')
     tpl->SetProtoMethodPromise("execCommand", &JSDeepSeek::execCommand);  // promise（AI 工具调用）
+    tpl->SetProtoMethodPromise("readFile", &JSDeepSeek::readFile);        // promise（AI 工具调用）
+    tpl->SetProtoMethodPromise("writeFile", &JSDeepSeek::writeFile);      // promise（AI 工具调用）
 
     JSDeepSeek::InitTpl(tpl);
     return tpl->CallConstructor();
@@ -208,6 +210,54 @@ void JSDeepSeek::chatStream(JQAsyncInfo &info)
 
         std::string resultJson = w->chatStream(requestJson, onDelta);
         info.post(Bson(resultJson));
+    } catch (const std::exception &e) {
+        info.postError(e.what());
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 异步：文件读写（AI 工具调用）
+//   readFile(path, maxBytes?) / writeFile(path, content)
+// ⚠ 安全判断（路径白名单、用户授权）在 JS 侧，本层只做 IO。
+// ----------------------------------------------------------------------------
+void JSDeepSeek::readFile(JQAsyncInfo &info)
+{
+    try {
+        if (info.Length() < 1 || !info[0].is_string()) {
+            info.postError("readFile: 需要路径字符串");
+            return;
+        }
+        std::string path = info[0].string_value();
+        long maxBytes = 262144;
+        if (info.Length() >= 2 && info[1].is_number()) maxBytes = (long)info[1].number_value();
+
+        DeepSeekWorker *w = getWorker();
+        if (w == nullptr) {
+            info.postError("deepseek worker 未初始化");
+            return;
+        }
+        info.post(Bson(w->readFile(path, maxBytes)));
+    } catch (const std::exception &e) {
+        info.postError(e.what());
+    }
+}
+
+void JSDeepSeek::writeFile(JQAsyncInfo &info)
+{
+    try {
+        if (info.Length() < 2 || !info[0].is_string() || !info[1].is_string()) {
+            info.postError("writeFile: 需要 (路径, 内容) 两个字符串");
+            return;
+        }
+        std::string path = info[0].string_value();
+        std::string content = info[1].string_value();
+
+        DeepSeekWorker *w = getWorker();
+        if (w == nullptr) {
+            info.postError("deepseek worker 未初始化");
+            return;
+        }
+        info.post(Bson(w->writeFile(path, content)));
     } catch (const std::exception &e) {
         info.postError(e.what());
     }

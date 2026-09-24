@@ -10,10 +10,93 @@
 // 安全：**所有命令都必须经 onConfirm 授权**，本模块不提供任何自动放行路径。
 
 import api from './deepseek-api.js';
-import { TOOL_DEFS, checkDanger, runCommand, formatResultForModel, validateCommand } from './tools.js';
+import {
+  TOOL_DEFS,
+  checkDanger,
+  runCommand,
+  formatResultForModel,
+  validateCommand,
+  validatePath,
+  readFile,
+  writeFile,
+  formatReadResult,
+  formatWriteResult,
+} from './tools.js';
 
 // 单次用户请求内最多允许的模型轮次（防止模型陷入工具调用死循环）
 const MAX_ROUNDS = 8;
+const DENIED_HINT = '用户拒绝了该操作。请不要重复请求，改用其他方式或直接说明。';
+
+// 执行单个工具调用，返回给模型看的结果文本。
+// ★ 每个分支都必须经过 h.onConfirm —— 这是唯一的执行闸门。
+async function executeOne(call, args, h, checkAbort) {
+  const name = call.function.name;
+  const reason = args ? String(args.reason || '') : '';
+
+  if (!args) return '参数不是合法 JSON，请检查后重试。';
+
+  // ---- run_command ----
+  if (name === 'run_command') {
+    const v = validateCommand(String(args.command || ''));
+    if (!v.ok) return '命令无效：' + v.reason;
+    const dangers = checkDanger(v.command);
+    const allowed = h.onConfirm
+      ? await h.onConfirm({ kind: 'command', command: v.command, reason, dangers })
+      : false;
+    checkAbort();
+    if (!allowed) return DENIED_HINT;
+    if (h.onCommandStart) h.onCommandStart({ command: v.command, reason });
+    const res = await runCommand(v.command, h.timeoutMs);
+    if (h.onCommandEnd) h.onCommandEnd({ command: v.command, result: res });
+    return formatResultForModel(res);
+  }
+
+  // ---- read_file ----
+  if (name === 'read_file') {
+    const v = validatePath(String(args.path || ''));
+    if (!v.ok) return '路径无效：' + v.reason;
+    const allowed = h.onConfirm
+      ? await h.onConfirm({ kind: 'read', path: v.path, reason, dangers: [] })
+      : false;
+    checkAbort();
+    if (!allowed) return DENIED_HINT;
+    if (h.onFileStart) h.onFileStart({ kind: 'read', path: v.path, reason });
+    const res = await readFile(v.path);
+    if (h.onFileEnd) h.onFileEnd({ kind: 'read', path: v.path, result: res });
+    return formatReadResult(res);
+  }
+
+  // ---- write_file ----
+  if (name === 'write_file') {
+    const v = validatePath(String(args.path || ''));
+    if (!v.ok) return '路径无效：' + v.reason;
+    const content = typeof args.content === 'string' ? args.content : '';
+    // 覆盖已有文件属于破坏性操作 → 复用危险提示机制
+    const dangers = [];
+    const prev = await readFile(v.path, 1); // 只探是否存在（maxBytes=1）
+    if (prev.ok) dangers.push('将覆盖已有文件（原内容会被替换）');
+
+    const allowed = h.onConfirm
+      ? await h.onConfirm({
+          kind: 'write',
+          path: v.path,
+          content,
+          bytes: content.length,
+          isNew: !prev.ok,
+          reason,
+          dangers,
+        })
+      : false;
+    checkAbort();
+    if (!allowed) return DENIED_HINT;
+    if (h.onFileStart) h.onFileStart({ kind: 'write', path: v.path, reason });
+    const res = await writeFile(v.path, content);
+    if (h.onFileEnd) h.onFileEnd({ kind: 'write', path: v.path, result: res });
+    return formatWriteResult(v.path, res);
+  }
+
+  return '未知工具：' + name;
+}
 
 // 把 assistant 的 tool_calls 消息转成 API 要求的格式（arguments 必须是字符串）
 function normalizeToolCalls(rawCalls) {
@@ -108,38 +191,7 @@ export async function runWithTools(messages, handlers) {
       const call = calls[i];
       const args = parseArgs(call.function);
 
-      let resultText;
-      if (call.function.name !== 'run_command') {
-        resultText = '未知工具：' + call.function.name;
-      } else if (!args) {
-        resultText = '参数不是合法 JSON，请重新给出 command 字段';
-      } else {
-        const cmd = String(args.command || '');
-        const v = validateCommand(cmd);
-        if (!v.ok) {
-          resultText = '命令无效：' + v.reason;
-        } else {
-          const dangers = checkDanger(v.command);
-          // ★ 唯一的执行闸门：必须由用户确认
-          let allowed = false;
-          if (h.onConfirm) allowed = await h.onConfirm({
-            command: v.command,
-            reason: String(args.reason || ''),
-            dangers,
-          });
-          checkAbort();
-
-          if (!allowed) {
-            resultText = '用户拒绝执行该命令。请不要重复请求，改用其他方式或直接说明。';
-          } else {
-            if (h.onCommandStart) h.onCommandStart({ command: v.command, reason: String(args.reason || '') });
-            const res2 = await runCommand(v.command, h.timeoutMs);
-            if (h.onCommandEnd) h.onCommandEnd({ command: v.command, result: res2 });
-            resultText = formatResultForModel(res2);
-          }
-        }
-      }
-
+      const resultText = await executeOne(call, args, h, checkAbort);
       messages.push({ role: 'tool', tool_call_id: call.id, content: resultText });
     }
   }

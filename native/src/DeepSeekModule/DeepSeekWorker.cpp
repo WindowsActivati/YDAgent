@@ -1132,6 +1132,207 @@ std::string DeepSeekWorker::saveStore(const std::string &content) const
 }
 
 // ---------------------------------------------------------------------------
+// 文件读写（AI 工具调用）
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 逐级 mkdir -p
+void mkdirsFor(const std::string &filePath)
+{
+    size_t slash = filePath.rfind('/');
+    if (slash == std::string::npos || slash == 0) return;
+    std::string dir = filePath.substr(0, slash);
+    for (size_t i = 1; i <= dir.size(); i++)
+    {
+        if (i == dir.size() || dir[i] == '/')
+        {
+            std::string sub = dir.substr(0, i);
+            ::mkdir(sub.c_str(), 0755); // 已存在返回 EEXIST，忽略
+        }
+    }
+}
+
+// 按行切分（保留行内容，不含换行符）
+std::vector<std::string> splitLines(const std::string &s)
+{
+    std::vector<std::string> out;
+    size_t start = 0;
+    for (size_t i = 0; i <= s.size(); i++)
+    {
+        if (i == s.size() || s[i] == '\n')
+        {
+            std::string line = s.substr(start, i - start);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            out.push_back(line);
+            start = i + 1;
+        }
+    }
+    // 末尾换行会产生一个多余空行，去掉（避免 diff 里多出空行）
+    if (out.size() > 1 && out.back().empty() && !s.empty() && s.back() == '\n')
+        out.pop_back();
+    return out;
+}
+
+// 生成面向"确认页展示"的 diff 预览（截断到 maxBytes 字节）。
+// 用最简单的 LCS 差异算法——文件通常不大，够用且不引入依赖。
+std::string buildDiffPreview(const std::string &oldText, const std::string &newText, size_t maxBytes)
+{
+    std::vector<std::string> a = splitLines(oldText);
+    std::vector<std::string> b = splitLines(newText);
+
+    // LCS 表（按 (n+1)*(m+1) 大小动态分配）
+    size_t n = a.size(), m = b.size();
+    // 防御：超大文件跳过精细 diff，退化为简单预览
+    if (n * m > 4000000)
+    {
+        return "[改动较大，diff 已省略]\n新内容共 " + std::to_string(m) + " 行";
+    }
+
+    std::vector<uint32_t> dp((n + 1) * (m + 1), 0);
+    auto at = [&](size_t i, size_t j) -> uint32_t & { return dp[i * (m + 1) + j]; };
+    for (size_t i = n; i-- > 0;)
+        for (size_t j = m; j-- > 0;)
+            at(i, j) = (a[i] == b[j]) ? at(i + 1, j + 1) + 1
+                                      : (at(i + 1, j) > at(i, j + 1) ? at(i + 1, j) : at(i, j + 1));
+
+    std::string out;
+    out.reserve(4096);
+    size_t i = 0, j = 0;
+    int context = 0;
+    auto emit = [&](char tag, const std::string &line) -> bool {
+        // 与上一行同类型时只补行，不重复打标签（紧凑显示连续增删）
+        if (tag == ' ' && context > 0) { context--; }
+        std::string lineOut(1, tag);
+        lineOut += line;
+        lineOut += '\n';
+        if (out.size() + lineOut.size() > maxBytes)
+        {
+            out += "...[diff 过长已截断]\n";
+            return false;
+        }
+        out += lineOut;
+        return true;
+    };
+
+    while (i < n && j < m)
+    {
+        if (a[i] == b[j])
+        {
+            if (!emit(' ', a[i])) return out;
+            i++; j++;
+        }
+        else if (at(i + 1, j) >= at(i, j + 1))
+        {
+            if (!emit('-', a[i])) return out;
+            context = 2; // 删除后保留 2 行上下文
+            i++;
+        }
+        else
+        {
+            if (!emit('+', b[j])) return out;
+            context = 2;
+            j++;
+        }
+    }
+    while (i < n) { if (!emit('-', a[i])) return out; i++; }
+    while (j < m) { if (!emit('+', b[j])) return out; j++; }
+
+    if (out.empty()) out = "(无变化)";
+    return out;
+}
+
+} // namespace
+
+std::string DeepSeekWorker::readFile(const std::string &path, long maxBytes) const
+{
+    long cap = maxBytes;
+    if (cap <= 0) cap = 262144;      // 默认 256KB
+    if (cap > 4194304) cap = 4194304; // 上限 4MB
+
+    FILE *f = fopen(path.c_str(), "rb");
+    if (f == nullptr)
+        return "{\"ok\":false,\"error\":\"文件不存在或无法打开\"}";
+
+    // 先探大小，便于提示"被截断"
+    fseek(f, 0, SEEK_END);
+    long total = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    std::string content;
+    char buf[8192];
+    size_t got = 0;
+    while (got < (size_t)cap)
+    {
+        size_t want = sizeof buf;
+        if ((size_t)cap - got < want) want = (size_t)cap - got;
+        size_t n = fread(buf, 1, want, f);
+        if (n == 0) break;
+        content.append(buf, n);
+        got += n;
+    }
+    fclose(f);
+
+    bool truncated = (total > (long)got);
+    std::string json = "{\"ok\":true,\"content\":\"" + JVal::escape(content) +
+                       "\",\"size\":" + std::to_string(total) +
+                       ",\"truncated\":" + (truncated ? "true" : "false") + "}";
+    return json;
+}
+
+std::string DeepSeekWorker::writeFile(const std::string &path, const std::string &content) const
+{
+    // 读旧内容（用于 diff 预览；不存在则为空 → 视为新建）
+    std::string oldText;
+    bool existed = false;
+    {
+        FILE *f = fopen(path.c_str(), "rb");
+        if (f != nullptr)
+        {
+            existed = true;
+            char buf[8192];
+            size_t n;
+            // diff 预览不需要全文，读前 512KB 足够
+            size_t total = 0;
+            while ((n = fread(buf, 1, sizeof buf, f)) > 0 && total < 524288)
+            {
+                oldText.append(buf, n);
+                total += n;
+            }
+            fclose(f);
+        }
+    }
+
+    mkdirsFor(path);
+
+    // 先写临时文件再 rename：避免写一半被杀导致文件损坏
+    std::string tmp = path + ".tmp";
+    FILE *f = fopen(tmp.c_str(), "wb");
+    if (f == nullptr)
+        return "{\"ok\":false,\"error\":\"无法写入（目录不存在或无权限）\"}";
+    size_t written = fwrite(content.data(), 1, content.size(), f);
+    int flushRc = fflush(f);
+    int closeRc = fclose(f);
+    if (written != content.size() || flushRc != 0 || closeRc != 0)
+    {
+        ::remove(tmp.c_str());
+        return "{\"ok\":false,\"error\":\"写入失败（磁盘空间或权限不足）\"}";
+    }
+    if (::rename(tmp.c_str(), path.c_str()) != 0)
+    {
+        ::remove(tmp.c_str());
+        return "{\"ok\":false,\"error\":\"保存失败（rename 失败）\"}";
+    }
+
+    std::string diff = existed ? buildDiffPreview(oldText, content, 4096)
+                               : ("(新建文件，共 " + std::to_string(splitLines(content).size()) + " 行)");
+
+    return "{\"ok\":true,\"bytes\":" + std::to_string(content.size()) +
+           ",\"created\":" + (existed ? "false" : "true") +
+           ",\"diff\":\"" + JVal::escape(diff) + "\"}";
+}
+
+// ---------------------------------------------------------------------------
 // 执行 shell 命令
 //
 // 设备无 `timeout` 命令，因此这里用 fork + pipe + poll 自己实现超时：

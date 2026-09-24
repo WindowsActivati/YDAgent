@@ -42,6 +42,21 @@ public:
     std::string chatStream(const std::string &requestJson, const DeltaFn &onDelta) const;
 
     // ---------------------------------------------------------------------
+    // 文件读写（AI 工具调用用）
+    //
+    // ⚠ 与 execCommand 同样的边界：本层**不做安全判断**（路径是否允许、
+    //   用户是否授权）——全部由 JS 侧负责（见 src/services/tools.js）。
+    //   这里只负责读/写/预览 diff，并把结果包成 JSON。
+    //
+    // readFile  : {"ok":true,"content":"...","size":N} / {"ok":false,"error":"..."}
+    // writeFile : {"ok":true,"bytes":N,"created":bool,"diff":"..."} / {"ok":false,"error":"..."}
+    //             created=true 表示新建文件（此前不存在）
+    //             diff 是写入前后的统一 diff 预览（截断到 ~4KB），供确认页展示
+    // ---------------------------------------------------------------------
+    std::string readFile(const std::string &path, long maxBytes) const;
+    std::string writeFile(const std::string &path, const std::string &content) const;
+
+    // ---------------------------------------------------------------------
     // 执行 shell 命令（AI 工具调用用）
     //
     // ⚠ 安全边界：本函数**不做任何安全判断**——是否危险、要不要拦截、用户是否
