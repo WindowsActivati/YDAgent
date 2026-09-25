@@ -18,6 +18,7 @@ import { getItem, setItem, removeItem } from './storage.js';
 
 const API_KEY_STORAGE_KEY = 'deepseek_api_key';
 const API_BASE_STORAGE_KEY = 'deepseek_api_base_url';
+const MODEL_STORAGE_KEY = 'deepseek_model';
 const NET_UNAVAILABLE = 'unavailable';
 
 export class ApiError extends Error {
@@ -32,6 +33,41 @@ export class ApiError extends Error {
 // 未配置时的统一错误码与文案（UI 据此引导用户去设置页）
 export const NOT_CONFIGURED = 'not_configured';
 export const NOT_CONFIGURED_MSG = '请先在设置里填写 API Key 和请求端点';
+
+// 模型名：storage 覆盖值优先，否则用内置默认。
+// 不同服务商的模型名不一样（如 deepseek-chat / gpt-4o-mini / qwen-plus），
+// 所以允许用户自行填写。返回 Promise（storage 是异步的）。
+export async function resolveModel() {
+  try {
+    const stored = await getItem(MODEL_STORAGE_KEY, null);
+    const m = stored == null ? '' : String(stored).trim();
+    if (m) return m;
+  } catch (e) {
+    // 忽略存储异常，用默认
+  }
+  return CONFIG.model;
+}
+
+// 模型名归一化：去掉空白与换行；允许字母数字及 . _ - : /（兼容
+// 各类服务商的命名，如 gpt-4o-mini、qwen2.5-7b-instruct、accounts/x/models/y）
+export function normalizeModel(raw) {
+  const s = String(raw == null ? '' : raw).trim().replace(/\s+/g, '');
+  if (!s) return '';
+  if (s.length > 128) return '';
+  if (!/^[A-Za-z0-9._:\/-]+$/.test(s)) return '';
+  return s;
+}
+
+// 保存模型名（空串 = 清除覆盖，回退默认）
+export async function saveModel(value) {
+  const v = normalizeModel(value);
+  if (!v) {
+    await removeItem(MODEL_STORAGE_KEY);
+    return CONFIG.model;
+  }
+  await setItem(MODEL_STORAGE_KEY, v);
+  return v;
+}
 
 // API Key：从设备存储读取；未设置返回 ''（不再有内置默认值）
 export async function resolveApiKey() {
@@ -99,10 +135,13 @@ export async function saveApiBaseUrl(value) {
 }
 
 // 当前生效值（供设置界面回显）：
-//   { apiKey, apiBaseUrl, hasKey, hasBase, configured }
+//   { apiKey, apiBaseUrl, model, hasKey, hasBase, hasModel, configured }
+// 注意：模型名有内置默认值，所以它**不影响** configured（只有 Key 和端点
+// 是必填项；不填模型名就用默认的 deepseek-chat）。
 export async function resolveSettings() {
   let storedKey = null;
   let storedBase = null;
+  let storedModel = null;
   try {
     storedKey = await getItem(API_KEY_STORAGE_KEY, null);
   } catch (e) {
@@ -113,13 +152,22 @@ export async function resolveSettings() {
   } catch (e) {
     /* 忽略 */
   }
+  try {
+    storedModel = await getItem(MODEL_STORAGE_KEY, null);
+  } catch (e) {
+    /* 忽略 */
+  }
   const key = storedKey && String(storedKey).trim() ? String(storedKey).trim() : '';
   const base = normalizeBaseUrl(storedBase);
+  const customModel = normalizeModel(storedModel);
   return {
     apiKey: key,
     apiBaseUrl: base,
+    model: customModel || CONFIG.model,
     hasKey: !!key,
     hasBase: !!base,
+    hasModel: !!customModel, // true = 用户自定义过（非默认）
+    defaultModel: CONFIG.model,
     configured: !!(key && base),
   };
 }
@@ -317,7 +365,8 @@ export async function chatRaw(messages, opts) {
   const apiBaseUrl = optsObj.apiBaseUrl || (await resolveApiBaseUrl());
   if (!apiKey || !apiBaseUrl) throw new ApiError(NOT_CONFIGURED_MSG, NOT_CONFIGURED, 0);
 
-  const payload = buildPayload(messages, optsObj.model);
+  const model = optsObj.model || (await resolveModel());
+  const payload = buildPayload(messages, model);
   if (Array.isArray(optsObj.tools) && optsObj.tools.length) {
     payload.tools = optsObj.tools;
     if (optsObj.tool_choice) payload.tool_choice = optsObj.tool_choice;
@@ -395,7 +444,8 @@ export async function chat(messages, opts) {
   const apiBaseUrl = optsObj.apiBaseUrl || (await resolveApiBaseUrl());
   // 未配置（Key 或端点缺失）：直接抛出，避免发出必然失败的请求
   if (!apiKey || !apiBaseUrl) throw new ApiError(NOT_CONFIGURED_MSG, NOT_CONFIGURED, 0);
-  const payload = buildPayload(messages, optsObj.model);
+  const model = optsObj.model || (await resolveModel());
+  const payload = buildPayload(messages, model);
 
   if (signal && signal.aborted) throw new ApiError('已取消', 'aborted', 0);
 
@@ -465,7 +515,8 @@ export async function chatStream(messages, opts, onDelta) {
   const apiKey = optsObj.apiKey || (await resolveApiKey());
   const apiBaseUrl = optsObj.apiBaseUrl || (await resolveApiBaseUrl());
   if (!apiKey || !apiBaseUrl) throw new ApiError(NOT_CONFIGURED_MSG, NOT_CONFIGURED, 0);
-  const payload = buildPayload(messages, optsObj.model);
+  const model = optsObj.model || (await resolveModel());
+  const payload = buildPayload(messages, model);
 
   // 无流式能力 → 退化为普通 chat（前端只看到「一次性出现」）
   if (typeof DeepSeek.chatStream !== 'function') {
@@ -527,11 +578,14 @@ export default {
   chatStream,
   resolveApiKey,
   resolveApiBaseUrl,
+  resolveModel,
   resolveSettings,
   isConfigured,
   saveApiKey,
   saveApiBaseUrl,
+  saveModel,
   normalizeBaseUrl,
+  normalizeModel,
   buildPayload,
   trimContext,
   ApiError,

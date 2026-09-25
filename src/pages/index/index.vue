@@ -194,7 +194,7 @@
 
       <!-- 内容可滚动：屏幕很矮（170 高），设置项放不下，不滚就点不到上面的项 -->
       <scroller class="settings-body">
-        <text class="field-note" v-if="!settings.configured">两项都填写后才能开始对话</text>
+        <text class="field-note" v-if="!settings.configured">API Key 和请求端点都填写后才能开始对话</text>
 
         <!-- API Key -->
         <text class="field-label">API Key</text>
@@ -213,6 +213,14 @@
         </view>
         <text class="field-hint" v-if="settings.hasBase">已设置</text>
         <text class="field-hint" v-else>尚未设置</text>
+
+        <!-- 模型名称（可选，默认 deepseek-chat） -->
+        <text class="field-label field-label-gap">模型名称</text>
+        <view class="field-box" activeClass="field-box-active" @click="onEditModel">
+          <text class="field-value">{{ settings.model }}</text>
+        </view>
+        <text class="field-hint" v-if="settings.hasModel">已自定义</text>
+        <text class="field-hint" v-else>默认值（可改，视服务商而定）</text>
 
         <!-- 清除配置 -->
         <view class="reset-btn" activeClass="reset-btn-active" @click="onClearSettings">
@@ -255,8 +263,11 @@ export default {
       settings: {
         apiKey: '',
         apiBaseUrl: '',
+        model: '',
         hasKey: false,
         hasBase: false,
+        hasModel: false,
+        defaultModel: '',
         configured: false,
       },
       // 是否已完成配置（未配置时输入框点击会引导去设置）
@@ -722,8 +733,11 @@ export default {
         this.settings = {
           apiKey: s.apiKey,
           apiBaseUrl: s.apiBaseUrl,
+          model: s.model,
           hasKey: s.hasKey,
           hasBase: s.hasBase,
+          hasModel: s.hasModel,
+          defaultModel: s.defaultModel,
           configured: s.configured,
         };
         this.configured = s.configured;
@@ -793,11 +807,50 @@ export default {
       }
     },
 
-    // 清除已保存的配置（Key + 端点）
+    // 用系统输入法输入模型名称
+    async onEditModel() {
+      const text = await openTextEditor(
+        defaultTextEditConfig({
+          title: '填写模型名称',
+          initialText: this.settings.hasModel ? this.settings.model : '',
+          multiLinesEditVisible: false,
+          maxBytes: 128,
+          enterButtonText: '保存',
+        })
+      ).catch(() => null);
+      if (this.destroyed || text == null) return;
+      const raw = String(text).trim();
+      // 空输入 = 恢复默认（方便用户撤销自定义）
+      if (!raw) {
+        try {
+          await api.saveModel('');
+          await this.refreshSettings();
+          diag('模型名已恢复默认');
+        } catch (e) {
+          diag('恢复默认模型失败: ' + (e && e.message ? e.message : String(e)));
+        }
+        return;
+      }
+      const normalized = api.normalizeModel(raw);
+      if (!normalized) {
+        this.warn('模型名称无效（仅限字母数字及 . _ - : /，且不超过 128 字符）');
+        return;
+      }
+      try {
+        await api.saveModel(normalized);
+        await this.refreshSettings();
+        diag('模型名称已保存: ' + normalized);
+      } catch (e) {
+        diag('保存模型名称失败: ' + (e && e.message ? e.message : String(e)));
+      }
+    },
+
+    // 清除已保存的配置（Key + 端点 + 模型名）
     async onClearSettings() {
       try {
         await api.saveApiKey('');
         await api.saveApiBaseUrl('');
+        await api.saveModel('');
         await this.refreshSettings();
         diag('已清除配置');
       } catch (e) {

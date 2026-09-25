@@ -11,7 +11,8 @@ const CONFIG = {
   apiBaseUrl: '',
   apiKey: '',
 
-  // 模型名：仅作用于请求体的 model 字段，随端点一起使用（默认 DeepSeek 官方模型名）
+  // 模型名：仅作用于请求体的 model 字段。可在设置页覆盖（不同服务商命名不同，
+  // 如 deepseek-chat / gpt-4o-mini / qwen-plus）。这里是内置默认值。
   model: 'deepseek-chat',
   requestTimeoutMs: 30000,
   maxTokens: 4096,
