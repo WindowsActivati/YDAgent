@@ -16,6 +16,13 @@ import CONFIG from '../config.js';
 import { DeepSeek } from 'deepseek'; // native 模块；开发期由 api-mock/deepseek.js 兜底
 import { getItem, setItem, removeItem } from './storage.js';
 
+// 诊断（app 内 console 不进设备日志，走 native 落盘）
+function diagKey(msg) {
+  try {
+    if (DeepSeek && typeof DeepSeek.debugLog === 'function') DeepSeek.debugLog('[api] ' + msg);
+  } catch (e) { /* 忽略 */ }
+}
+
 const API_KEY_STORAGE_KEY = 'deepseek_api_key';
 const API_BASE_STORAGE_KEY = 'deepseek_api_base_url';
 const MODEL_STORAGE_KEY = 'deepseek_model';
@@ -378,6 +385,16 @@ export async function chatRaw(messages, opts) {
     timeout_ms: CONFIG.requestTimeoutMs,
   });
   const bodyJson = JSON.stringify(body);
+
+  // 诊断：记录本次请求使用的 Key 特征，用于确认"存储里的 Key"与"实际发送的
+  // Key"是否一致（401 排查的关键信息）。
+  // 只记录长度与前缀格式，**不记录任何字符片段**——日志可能在排查时被分享出去。
+  try {
+    const k = String(apiKey);
+    const looksValid = /^sk-[A-Za-z0-9_-]+$/.test(k);
+    diagKey('请求: keyLen=' + k.length + ' 格式' + (looksValid ? '正常' : '异常!') +
+            ' model=' + model + ' base=' + apiBaseUrl);
+  } catch (e) { /* 忽略 */ }
   const onDelta = typeof optsObj.onDelta === 'function' ? optsObj.onDelta : null;
 
   let nativeError = null;
@@ -398,6 +415,9 @@ export async function chatRaw(messages, opts) {
       }
       const err = (res && res.error) || {};
       if (err.code !== NET_UNAVAILABLE) {
+        // 记录失败详情（含 status / code），便于区分 401/429/格式错误
+        diagKey('流式请求失败: code=' + (err.code || '?') + ' status=' + (err.status || 0) +
+                ' msg=' + (err.message || ''));
         throw new ApiError(err.message || 'native 请求失败', err.code || 'native_error', err.status || 0);
       }
       nativeError = new ApiError(err.message || 'native 网络不可用', NET_UNAVAILABLE, 0);

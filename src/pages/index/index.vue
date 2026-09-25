@@ -244,6 +244,14 @@ function diag(msg) {
   logDiag('[chat] ' + msg);
 }
 
+// 是否为"错误气泡"。历史上存在标记丢失的情况（持久化后 isError 字段没了），
+// 导致旧的错误消息被当成正常回复反复显示——所以同时按内容前缀识别。
+function isErrorBubble(m) {
+  if (!m) return true;
+  if (m.isError) return true;
+  return typeof m.content === 'string' && m.content.indexOf('⚠') === 0;
+}
+
 export default {
   name: 'index',
 
@@ -288,7 +296,7 @@ export default {
     // 是否已有流式内容进来（用于决定"思考中"动画是否该收起）
     hasStreamingText() {
       const last = this.messages.length ? this.messages[this.messages.length - 1] : null;
-      return !!(last && last.role === 'assistant' && last.content && !last.isError);
+      return !!(last && last.role === 'assistant' && last.content && !isErrorBubble(last));
     },
     // 当前是否正在逐字输出（用于在气泡末尾显示闪烁光标）
     streamingCursor() {
@@ -372,7 +380,7 @@ export default {
         this.sessions = data.sessions;
         this.activeId = data.activeId;
         const cur = this.sessions.find((s) => s.id === this.activeId);
-        const msgs = cur && Array.isArray(cur.messages) ? cur.messages.filter((m) => m && !m.isError) : [];
+        const msgs = cur && Array.isArray(cur.messages) ? cur.messages.filter((m) => !isErrorBubble(m)) : [];
         diag('载入 ' + this.sessions.length + ' 个会话，当前 ' + msgs.length + ' 条消息');
         if (msgs.length) {
           this.messages = msgs;
@@ -594,7 +602,7 @@ export default {
     // 把当前消息写回活动会话，并按时间倒序落盘（空会话不落盘）
     persistHistory() {
       // 只存最近若干条，且不落盘错误气泡（下次打开时它们没有意义）
-      const clean = this.messages.filter((m) => m && !m.isError);
+      const clean = this.messages.filter((m) => !isErrorBubble(m));
       const keep = clean.slice(-CONFIG.storageMaxItems);
 
       let idx = this.sessions.findIndex((s) => s.id === this.activeId);
@@ -667,7 +675,7 @@ export default {
       this.generation += 1;
       this.thinking = false;
       // 先把当前进度存下（否则刚聊的内容会丢）
-      if (this.messages.filter((m) => m && !m.isError).length) this.persistHistory();
+      if (this.messages.filter((m) => !isErrorBubble(m)).length) this.persistHistory();
 
       const s = emptySession();
       this.sessions = [s].concat(this.sessions);
@@ -687,11 +695,11 @@ export default {
       }
       this.generation += 1;
       this.thinking = false;
-      if (this.messages.filter((m) => m && !m.isError).length) this.persistHistory();
+      if (this.messages.filter((m) => !isErrorBubble(m)).length) this.persistHistory();
 
       this.activeId = id;
       const s = this.sessions.find((x) => x.id === id);
-      this.messages = s && Array.isArray(s.messages) ? s.messages.filter((m) => m && !m.isError) : [];
+      this.messages = s && Array.isArray(s.messages) ? s.messages.filter((m) => !isErrorBubble(m)) : [];
       this.draftText = '';
       this.menuOpen = false;
       this.scrollToBottom();
@@ -712,7 +720,7 @@ export default {
         const next = this.sessions[0];
         if (next) {
           this.activeId = next.id;
-          this.messages = Array.isArray(next.messages) ? next.messages.filter((m) => m && !m.isError) : [];
+          this.messages = Array.isArray(next.messages) ? next.messages.filter((m) => !isErrorBubble(m)) : [];
         } else {
           const s = emptySession();
           this.sessions = [s];
