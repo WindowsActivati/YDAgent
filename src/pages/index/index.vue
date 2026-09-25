@@ -49,6 +49,8 @@
           <text class="bubble-ai-text">{{ m.content }}</text>
           <!-- 流式光标：仅当前正在输出的那条 -->
           <text class="stream-cursor" v-if="streamingCursor && index === messages.length - 1">▍</text>
+          <!-- 被用户停止：标明内容不完整，避免被误读为完整回答 -->
+          <text class="stopped-mark" v-if="m.stopped">（已停止）</text>
         </view>
       </view>
 
@@ -73,8 +75,14 @@
         <text class="input-placeholder" v-if="!draftText">输入问题…</text>
         <text class="input-text" v-else>{{ draftText }}</text>
       </view>
-      <view class="send-btn" activeClass="send-btn-active" @click="onSend">
-        <text class="send-btn-text">发送</text>
+      <!-- 发送 / 停止：AI 回复期间变为「停止」 -->
+      <view
+        class="send-btn"
+        :class="{ 'send-btn-stop': thinking }"
+        :activeClass="thinking ? 'send-btn-stop-active' : 'send-btn-active'"
+        @click="thinking ? onStop() : onSend()"
+      >
+        <text class="send-btn-text">{{ thinking ? '停止' : '发送' }}</text>
       </view>
     </view>
     </view>
@@ -262,6 +270,8 @@ export default {
       thinking: false,
       destroyed: false,
       generation: 0,
+      // 用户点击「停止」后置 true；signal.aborted 会读到它，中断 agent 循环
+      stopRequested: false,
       historyLoaded: false,
       historyLoading: false,
       // 存储不可用时提示用户（否则「退出即失忆」会让人困惑）
@@ -431,6 +441,7 @@ export default {
 
       const gen = ++this.generation;
       this.thinking = true;
+      this.stopRequested = false; // 新一轮开始，清除上次的停止标记
 
       // 每轮对话一个气泡：模型先说一段话 → 若要求调用工具，那段话就留在
       // 自己的气泡里（作为"我要做什么"的说明），工具执行记录插在它后面，
@@ -459,11 +470,22 @@ export default {
       const alive = () => !this.destroyed && gen === this.generation;
 
       try {
-        // 走 agent 循环：模型可请求执行命令/读写文件，每个操作都要用户确认
+        // 走 agent 循环：模型可请求执行命令/读写文件，每个操作都要用户确认。
+        //
+        // signal.aborted 必须用 getter 动态求值：写成普通对象
+        // { aborted: this.destroyed || gen !== this.generation } 只会在创建时
+        // 求值一次，之后 gen 变化不会更新，导致「停止」永远无效。
+        const self = this;
+        const signal = {
+          get aborted() {
+            return self.destroyed || self.stopRequested || gen !== self.generation;
+          },
+        };
+
         const reply = await runWithTools(
           this.messages.filter((m) => m !== bubble),
           {
-            signal: { aborted: this.destroyed || gen !== this.generation },
+            signal,
             onDelta,
             // 每轮结束：若模型要继续调用工具，当前气泡定型（它只是说明文字），
             // 下一轮另起气泡；否则当前气泡就是最终答案。
@@ -516,6 +538,25 @@ export default {
         if (!alive()) return;
         if (bubble && !bubble.content.trim()) bubble.content = reply;
       } catch (e) {
+        // 用户主动停止：不算错误。保留已收到的内容，并清掉空气泡。
+        // 注意这里不能用 alive() 判断——停止时 generation 已递增，alive() 为 false，
+        // 直接 return 会导致已输出的内容留在界面上却没有"已停止"的收尾。
+        if (this.stopRequested && gen !== this.generation) {
+          if (bubble) {
+            if (!bubble.content.trim()) {
+              const bi = this.messages.indexOf(bubble);
+              if (bi >= 0) this.messages.splice(bi, 1); // 空气泡直接移除
+            } else {
+              // 标记 isError：不完整的回答若进入下一轮上下文会误导模型
+              // （它会把半截话当成自己说过的完整结论），所以按错误气泡处理，
+              // 仅在界面上保留展示并加「（已停止）」尾注。
+              bubble.stopped = true;
+              bubble.isError = true;
+            }
+          }
+          diag('已停止（保留已收到 ' + (bubble ? bubble.content.length : 0) + ' 字）');
+          return;
+        }
         if (!alive()) return;
         const msg = e && e.message ? e.message : '请求失败，请稍后重试';
         // 未配置：撤掉空气泡，改为引导用户去设置（不是错误，是还没设置好）
@@ -539,11 +580,36 @@ export default {
           this.messages.push({ role: 'assistant', content: '⚠ ' + msg, isError: true });
         }
       } finally {
-        if (!this.destroyed && gen === this.generation) {
+        // 收尾必须执行，不能只看 gen === this.generation：
+        // 用户点「停止」会递增 generation，若在这里跳过，thinking 会永远为 true，
+        // 按钮卡在「停止」、再也发不出消息。
+        if (!this.destroyed) {
+          const isCurrent = gen === this.generation;
           this.thinking = false;
+          this.stopRequested = false;
           this.scrollToBottom();
+          // 仅当前请求负责落盘；被停止的那次内容也已保留，同样值得保存
           this.persistHistory();
+          if (!isCurrent) diag('已停止并收尾');
         }
+      }
+    },
+
+    // 点击「停止」：中断 AI 回复（包括工具调用循环）。
+    // 递增 generation 会让 signal.aborted 变为 true，agent 循环在下一个检查点退出；
+    // 正在等待的用户授权也会被一并取消（避免弹窗悬挂）。
+    onStop() {
+      if (!this.thinking) return;
+      this.generation += 1;
+      this.stopRequested = true;
+      diag('用户停止 AI 回复');
+      // 若此刻正卡在命令授权弹窗上，把它取消掉（拒绝 = 不执行）
+      if (this.confirm && this._confirmResolve) {
+        const r = this._confirmResolve;
+        this._confirmResolve = null;
+        this.confirm = null;
+        this.confirmDangers = [];
+        r(false);
       }
     },
 
@@ -1118,6 +1184,13 @@ export default {
   overflow-wrap: break-word;
 }
 
+// 「已停止」尾注：中性灰，不用红色（停止是用户主动行为，不是错误）
+.stopped-mark {
+  font-size: 22rpx;
+  color: @text-faint;
+  line-height: 32rpx;
+}
+
 // 流式光标
 .stream-cursor {
   font-size: 28rpx;
@@ -1270,6 +1343,16 @@ export default {
 
 .send-btn-active {
   background-color: @primary-deep;
+}
+
+// 停止：AI 回复期间替换发送按钮。用中性灰而非红色——停止是常规操作，
+// 不是破坏性动作，红色会造成不必要的紧张感。
+.send-btn-stop {
+  background-color: @background-elevated;
+}
+
+.send-btn-stop-active {
+  background-color: @border-strong;
 }
 
 .send-btn-text {

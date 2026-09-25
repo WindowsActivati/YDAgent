@@ -23,8 +23,13 @@ import {
   formatWriteResult,
 } from './tools.js';
 
-// 单次用户请求内最多允许的模型轮次（防止模型陷入工具调用死循环）
-const MAX_ROUNDS = 8;
+// 工具调用轮次上限。
+// 用户可随时点「停止」中断，因此这里不再限制轮数（设为 Infinity 表示不限制）。
+// 注意：仅在**连续**达到该轮数且期间无任何用户可见产出时才熔断——留作死循环
+// 的兜底（例如模型反复调用同一命令），避免无限烧 token 且无从察觉。
+const MAX_ROUNDS = Infinity;
+// 连续多少轮"只调工具、没产生任何正文"就认为陷入死循环并中止
+const MAX_BARREN_ROUNDS = 40;
 const DENIED_HINT = '用户拒绝了该操作。请不要重复请求，改用其他方式或直接说明。';
 
 // 执行单个工具调用，返回给模型看的结果文本。
@@ -155,6 +160,8 @@ export async function runWithTools(messages, handlers) {
     if (signal && signal.aborted) throw abortErr();
   };
 
+  let barrenRounds = 0; // 连续"只调工具、无正文产出"的轮数
+
   for (let round = 0; round < MAX_ROUNDS; round++) {
     checkAbort();
 
@@ -170,18 +177,26 @@ export async function runWithTools(messages, handlers) {
     const res = await api.chatRaw(messages, opts);
     checkAbort();
 
+    const hasCalls = !!(res.toolCalls && res.toolCalls.length);
+    const hasText = !!(res.content && res.content.trim());
+
     // 一轮结束：告诉 UI 本轮结果，由它决定"这段文字定为最终答案"还是
     // "只是调用工具前的说明、需要另起一个气泡继续"。
     if (h.onRoundEnd) {
-      h.onRoundEnd({
-        hadToolCalls: !!(res.toolCalls && res.toolCalls.length),
-        content: res.content || '',
-      });
+      h.onRoundEnd({ hadToolCalls: hasCalls, content: res.content || '' });
     }
 
     // 无工具调用 → 这就是最终回答
-    if (!res.toolCalls || !res.toolCalls.length) {
+    if (!hasCalls) {
       return res.content || '';
+    }
+
+    // 死循环兜底：连续多轮既不说话也不结束，只反复调工具
+    barrenRounds = hasText ? 0 : barrenRounds + 1;
+    if (barrenRounds >= MAX_BARREN_ROUNDS) {
+      checkAbort();
+      return '（工具调用已连续进行 ' + barrenRounds + ' 轮仍无结果，已自动停止。'
+           + '可以告诉我更具体的目标，或换一种方式。）';
     }
 
     const calls = normalizeToolCalls(res.toolCalls);
